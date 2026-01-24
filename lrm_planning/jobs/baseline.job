@@ -1,0 +1,85 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100          # Partition name
+#SBATCH --gres=gpu:2                  # Number of GPUs to allocate
+#SBATCH --cpus-per-task=24            # Number of CPU cores per task
+#SBATCH --mem=200G
+#SBATCH --job-name=baseline_deepseek_r1 # Job name (customize)
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=4:00:00               # Time limit hh:mm:ss (increased for evaluation)
+#SBATCH --output=/home/dpereira/lrm_planning/work/baseline_%A.out  # Standard output (%A expands to job ID)
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+source /home/dpereira/lrm_planning/reasoning_env/bin/activate
+
+# Set all cache directories to scratch to avoid disk quota issues
+export SCRATCH_DIR=/scratch-shared/dpereira
+mkdir -p $SCRATCH_DIR
+
+# HuggingFace cache
+export HF_HOME=$SCRATCH_DIR/hf_cache/furiosa
+mkdir -p $HF_HOME
+
+# vLLM cache
+export VLLM_CACHE_ROOT=$SCRATCH_DIR/vllm_cache
+mkdir -p $VLLM_CACHE_ROOT
+
+# PyTorch/Triton compilation caches
+export TORCH_HOME=$SCRATCH_DIR/torch_cache
+export TRITON_CACHE_DIR=$SCRATCH_DIR/triton_cache
+mkdir -p $TORCH_HOME
+mkdir -p $TRITON_CACHE_DIR
+
+# General XDG cache
+export XDG_CACHE_HOME=$SCRATCH_DIR/cache
+mkdir -p $XDG_CACHE_HOME
+
+# Disable vLLM usage stats collection (writes to home directory)
+export VLLM_NO_USAGE_STATS=1
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd $REPO_ROOT
+
+# Create work directory for server logs
+mkdir -p work
+
+# Start vllm server in the background
+echo "Starting vllm server..."
+vllm serve "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
+    --tensor-parallel-size 2 \
+    --max-model-len 24576 \
+    --gpu-memory-utilization 0.95 \
+    --port 8000 \
+    > work/vllm_server.log 2>&1 &
+
+VLLM_PID=$!
+echo "vllm server started with PID: $VLLM_PID"
+
+# Wait for server to be ready
+echo "Waiting for server to initialize..."
+sleep 240
+
+# Check if server is running
+if ! kill -0 $VLLM_PID 2>/dev/null; then
+    echo "ERROR: vllm server failed to start!"
+    echo "Check work/vllm_server.log for details"
+    exit 1
+fi
+
+echo "Server process is running. Starting evaluation..."
+
+# Run the baseline evaluation
+python baseline.py
+
+EVAL_EXIT_CODE=$?
+
+# Clean up - kill the vllm server
+echo "Evaluation complete. Shutting down vllm server..."
+kill $VLLM_PID
+wait $VLLM_PID 2>/dev/null
+
+echo "Job finished with exit code: $EVAL_EXIT_CODE"
+exit $EVAL_EXIT_CODE
+

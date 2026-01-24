@@ -1,0 +1,183 @@
+Starting vllm server...
+vllm server started with PID: 2083170
+Waiting for server to initialize...
+Server process is running. Starting evaluation...
+Waiting for vllm server to be ready...
+✓ Server is ready and responding!
+================================================================================
+DeepSeek R1 Baseline Evaluation - Towers of Hanoi
+================================================================================
+
+
+================================================================================
+Testing 3 Disks - Sanity check (Logic verification)
+================================================================================
+  Trial 1/10: 3 disks... ✓ Reward: 1.50, Violations: 0, Time: 55.1s
+  Trial 2/10: 3 disks... ✓ Reward: 1.50, Violations: 0, Time: 38.2s
+  Trial 3/10: 3 disks... ✓ Reward: 1.50, Violations: 0, Time: 30.6s
+  Trial 4/10: 3 disks... ✓ Reward: 1.50, Violations: 0, Time: 53.3s
+  Trial 5/10: 3 disks... ✓ Reward: 1.50, Violations: 0, Time: 20.2s
+  Trial 6/10: 3 disks... ✓ Reward: 1.50, Violations: 0, Time: 27.7s
+  Trial 7/10: 3 disks... ✓ Reward: 1.50, Violations: 0, Time: 26.3s
+  Trial 8/10: 3 disks... ✓ Reward: 1.50, Violations: 0, Time: 28.7s
+  Trial 9/10: 3 disks... ✗ Reward: 0.00, Violations: 11, Time: 14.3s
+  Trial 10/10: 3 disks... ✓ Reward: 1.50, Violations: 0, Time: 26.4s
+
+================================================================================
+SUMMARY FOR 3 DISKS: 9/10 correct
+================================================================================
+  Accuracy: 90.0%
+  Avg Reward: 1.350
+  Avg Violations: 1.1
+
+Progress: 10/60 problems completed
+
+================================================================================
+Testing 4 Disks - Sanity check
+================================================================================
+  Trial 1/10: 4 disks... ✗ Reward: 0.12, Violations: 1, Time: 49.2s
+  Trial 2/10: 4 disks... ✗ Reward: 0.00, Violations: 15, Time: 60.1s
+  Trial 3/10: 4 disks... ✗ Reward: 0.40, Violations: 6, Time: 71.9s
+  Trial 4/10: 4 disks... ✓ Reward: 1.50, Violations: 0, Time: 41.6s
+  Trial 5/10: 4 disks... ✗ Reward: 0.00, Violations: 19, Time: 27.5s
+  Trial 6/10: 4 disks... ✓ Reward: 1.50, Violations: 0, Time: 54.3s
+  Trial 7/10: 4 disks... ✗ Reward: 0.00, Violations: 29, Time: 71.9s
+  Trial 8/10: 4 disks... ✓ Reward: 1.10, Violations: 1, Time: 58.1s
+  Trial 9/10: 4 disks... ✗ Reward: 0.22, Violations: 0, Time: 71.9s
+  Trial 10/10: 4 disks... ✓ Reward: 1.50, Violations: 0, Time: 50.1s
+
+================================================================================
+SUMMARY FOR 4 DISKS: 4/10 correct
+================================================================================
+  Accuracy: 40.0%
+  Avg Reward: 0.635
+  Avg Violations: 7.1
+
+Progress: 20/60 problems completed
+
+================================================================================
+Testing 5 Disks - Standard benchmark (Medium difficulty)
+================================================================================
+  Trial 1/10: 5 disks... ✗ Reward: 0.00, Violations: 44, Time: 71.9s
+  Trial 2/10: 5 disks... ✗ Reward: 0.12, Violations: 0, Time: 71.9s
+  Trial 3/10: 5 disks... ✗ Reward: 0.00, Violations: 45, Time: 71.9s
+  Trial 4/10: 5 disks... ✗ Reward: 0.00, Violations: 49, Time: 71.9s
+  Trial 5/10: 5 disks... ✗ Reward: 0.00, Violations: 33, Time: 71.9s
+  Trial 6/10: 5 disks... ✗ Reward: 0.00, Violations: 28, Time: 71.9s
+  Trial 7/10: 5 disks... ✗ Reward: 0.00, Violations: 55, Time: 71.9s
+  Trial 8/10: 5 disks... ✗ Reward: 0.08, Violations: 1, Time: 69.0s
+  Trial 9/10: 5 disks... ✗ Reward: 0.00, Violations: 56, Time: 71.9s
+  Trial 10/10: 5 disks... ✗ Reward: 0.00, Violations: 21, Time: 29.7s
+
+================================================================================
+SUMMARY FOR 5 DISKS: 0/10 correct
+================================================================================
+  Accuracy: 0.0%
+  Avg Reward: 0.020
+  Avg Violations: 33.2
+
+Progress: 30/60 problems completed
+
+================================================================================
+Testing 6 Disks - The Critical Zone (Testing recursion stability)
+================================================================================
+  Trial 1/10: 6 disks... ✗ Reward: 0.00, Violations: 4, Time: 71.9s
+  Trial 2/10: 6 disks... ✗ Reward: 0.00, Violations: 34, Time: 71.9s
+  Trial 3/10: 6 disks... ✗ Reward: 0.00, Violations: 26, Time: 71.9s
+  Trial 4/10: 6 disks... ✗ Reward: 0.00, Violations: 10, Time: 71.9s
+  Trial 5/10: 6 disks... ✗ Reward: 0.00, Violations: 23, Time: 71.9s
+  Trial 6/10: 6 disks... ✗ Reward: 0.00, Violations: 18, Time: 71.9s
+  Trial 7/10: 6 disks... ✗ Reward: 0.00, Violations: 43, Time: 71.9s
+  Trial 8/10: 6 disks... ✗ Reward: 0.00, Violations: 15, Time: 45.3s
+  Trial 9/10: 6 disks... ✗ Reward: 0.00, Violations: 46, Time: 71.9s
+  Trial 10/10: 6 disks... ✗ Reward: 0.00, Violations: 32, Time: 71.9s
+
+================================================================================
+SUMMARY FOR 6 DISKS: 0/10 correct
+================================================================================
+  Accuracy: 0.0%
+  Avg Reward: 0.000
+  Avg Violations: 25.1
+
+Progress: 40/60 problems completed
+
+================================================================================
+Testing 7 Disks - The Critical Zone (Testing state tracking)
+================================================================================
+  Trial 1/10: 7 disks... ✗ Reward: 0.00, Violations: 12, Time: 71.9s
+  Trial 2/10: 7 disks... ✗ Reward: 0.00, Violations: 24, Time: 71.9s
+  Trial 3/10: 7 disks... ✗ Reward: 0.00, Violations: 25, Time: 71.9s
+  Trial 4/10: 7 disks... ✗ Reward: 0.17, Violations: 0, Time: 71.9s
+  Trial 5/10: 7 disks... ✗ Reward: 0.00, Violations: 28, Time: 71.9s
+  Trial 6/10: 7 disks... ✗ Reward: 0.00, Violations: 35, Time: 71.9s
+  Trial 7/10: 7 disks... ✗ Reward: 0.00, Violations: 9, Time: 71.9s
+  Trial 8/10: 7 disks... ✗ Reward: 0.09, Violations: 0, Time: 53.7s
+  Trial 9/10: 7 disks... ✗ Reward: 0.00, Violations: 22, Time: 71.9s
+  Trial 10/10: 7 disks... ✗ Reward: 0.00, Violations: 24, Time: 71.9s
+
+================================================================================
+SUMMARY FOR 7 DISKS: 0/10 correct
+================================================================================
+  Accuracy: 0.0%
+  Avg Reward: 0.026
+  Avg Violations: 17.9
+
+Progress: 50/60 problems completed
+
+================================================================================
+Testing 8 Disks - Boundary testing (Checking for collapse)
+================================================================================
+  Trial 1/10: 8 disks... ✗ Reward: 0.00, Violations: 6, Time: 71.9s
+  Trial 2/10: 8 disks... ✗ Reward: 0.00, Violations: 31, Time: 71.9s
+  Trial 3/10: 8 disks... ✗ Reward: 0.00, Violations: 27, Time: 71.9s
+  Trial 4/10: 8 disks... ✗ Reward: 0.00, Violations: 25, Time: 71.9s
+  Trial 5/10: 8 disks... ✗ Reward: 0.00, Violations: 13, Time: 71.9s
+  Trial 6/10: 8 disks... ✗ Reward: 0.00, Violations: 23, Time: 55.2s
+  Trial 7/10: 8 disks... ✗ Reward: 0.07, Violations: 0, Time: 71.9s
+  Trial 8/10: 8 disks... ✗ Reward: 0.00, Violations: 1, Time: 30.9s
+  Trial 9/10: 8 disks... ✗ Reward: 0.04, Violations: 0, Time: 62.7s
+  Trial 10/10: 8 disks... ✗ Reward: 0.00, Violations: 16, Time: 71.9s
+
+================================================================================
+SUMMARY FOR 8 DISKS: 0/10 correct
+================================================================================
+  Accuracy: 0.0%
+  Avg Reward: 0.011
+  Avg Violations: 14.2
+
+Progress: 60/60 problems completed
+
+================================================================================
+FINAL EVALUATION SUMMARY
+================================================================================
+
+Model: casperhansen/deepseek-r1-distill-qwen-32b-awq
+Timestamp: 20260121_213321
+
+Overall Performance:
+  Total Problems: 60
+  Correct Solutions: 13
+  Overall Accuracy: 21.67%
+  Average Reward: 0.340
+  Average Violations: 16.43
+  Average Generation Time: 59.94s
+
+Per-Disk Performance:
+  Disks  Correct/Total   Accuracy     Avg Reward   Description                                       
+  ------ --------------- ------------ ------------ --------------------------------------------------
+  3      9/10              90.0%       1.350      Sanity check (Logic verification)                 
+  4      4/10              40.0%       0.635      Sanity check                                      
+  5      0/10               0.0%       0.020      Standard benchmark (Medium difficulty)            
+  6      0/10               0.0%       0.000      The Critical Zone (Testing recursion stability)   
+  7      0/10               0.0%       0.026      The Critical Zone (Testing state tracking)        
+  8      0/10               0.0%       0.011      Boundary testing (Checking for collapse)          
+================================================================================
+
+✓ Full results saved to: ./baseline_results/deepseek_r1_full_20260121_213321.json
+✓ Summary statistics saved to: ./baseline_results/deepseek_r1_summary_20260121_213321.json
+✓ Individual outputs saved to: ./baseline_results/outputs_20260121_213321/
+
+✓ Evaluation complete! Total time: 59.9 minutes
+✓ Results saved to: ./baseline_results/
+Evaluation complete. Shutting down vllm server...
+Job finished with exit code: 0

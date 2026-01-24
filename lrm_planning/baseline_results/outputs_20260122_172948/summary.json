@@ -1,0 +1,24 @@
+{
+  "timestamp": "20260122_172948",
+  "model": "casperhansen/deepseek-r1-distill-qwen-32b-awq",
+  "overall": {
+    "total_problems": 5,
+    "successful_api_calls": 5,
+    "correct_solutions": 0,
+    "overall_accuracy": 0.0,
+    "avg_reward": 0.0,
+    "avg_violations": 32.6,
+    "avg_generation_time": 52.28756937980652
+  },
+  "per_disk_count": {
+    "3": {
+      "description": "Sanity check (Logic verification) - DEBUG",
+      "num_trials": 5,
+      "correct": 0,
+      "accuracy": 0.0,
+      "avg_reward": 0.0,
+      "avg_violations": 32.6,
+      "avg_time": 52.28756937980652
+    }
+  }
+}
