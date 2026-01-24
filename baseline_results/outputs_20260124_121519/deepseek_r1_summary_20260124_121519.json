@@ -1,0 +1,42 @@
+{
+  "timestamp": "20260124_121519",
+  "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+  "overall": {
+    "total_problems": 9,
+    "successful_api_calls": 9,
+    "correct_solutions": 1,
+    "overall_accuracy": 0.1111111111111111,
+    "avg_reward": 0.16666666666666666,
+    "avg_violations": 0.8888888888888888,
+    "avg_generation_time": 144.77321049902173
+  },
+  "per_disk_count": {
+    "3": {
+      "description": "3 disks",
+      "num_trials": 3,
+      "correct": 1,
+      "accuracy": 0.3333333333333333,
+      "avg_reward": 0.5,
+      "avg_violations": 0.6666666666666666,
+      "avg_time": 40.6590789159139
+    },
+    "4": {
+      "description": "4 disks",
+      "num_trials": 3,
+      "correct": 0,
+      "accuracy": 0.0,
+      "avg_reward": 0.0,
+      "avg_violations": 1.0,
+      "avg_time": 229.7563513914744
+    },
+    "5": {
+      "description": "5 disks",
+      "num_trials": 3,
+      "correct": 0,
+      "accuracy": 0.0,
+      "avg_reward": 0.0,
+      "avg_violations": 1.0,
+      "avg_time": 163.9042011896769
+    }
+  }
+}

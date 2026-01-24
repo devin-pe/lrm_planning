@@ -238,23 +238,35 @@ class TowersOfHanoiValidator:
     def parse_moves(self, reasoning_trace: str) -> List[List[int]]:
         """
         Extract moves from reasoning trace.
-        Follows the same pattern as reference implementation.
+        Handles both single-line and multi-line formatted arrays.
         
         Returns:
             List of [disk, from_peg, to_peg] moves (all integers, 0-indexed)
         """
         import json
         
-        # Find the moves array in the format: moves = [[disk, from, to], ...]
-        candidates = re.findall(r'moves\s*=\s*(\[\[.*?\]\])', reasoning_trace, re.DOTALL)
+        # Find the moves array - handle both compact and pretty-printed formats
+        # Pattern matches: moves = [ ... ] with optional whitespace and newlines
+        pattern = r'moves\s*=\s*(\[[^\]]*\](?:\s*,?\s*\n?\s*\])?)'
+        
+        # Try to find array with nested brackets first
+        candidates = re.findall(r'moves\s*=\s*(\[(?:\s*\[[^\]]+\]\s*,?\s*)+\])', reasoning_trace, re.DOTALL)
         
         if len(candidates) == 0:
             raise ValueError(
                 "No moves found in solution. Expected format: moves = [[disk id, from peg, to peg], ...]"
             )
         
-        # Parse the JSON array (take the last occurrence)
-        moves = json.loads(candidates[-1])
+        # Clean up the matched string and parse
+        moves_str = candidates[-1].strip()
+        # Remove any trailing text after the final ]
+        moves_str = re.sub(r'\]\s*[^\]]*$', ']', moves_str)
+        
+        try:
+            moves = json.loads(moves_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse moves array: {e}")
+        
         return moves
     
     def validate_trace(self, reasoning_trace: str, problem_state: Dict) -> Tuple[float, int]:
