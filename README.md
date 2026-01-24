@@ -1,1 +1,1 @@
-# lrm_planning
+# Large Reasoning Models for Planning
