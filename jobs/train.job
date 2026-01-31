@@ -1,0 +1,50 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_h100          # Partition name
+#SBATCH --gres=gpu:1                  # Number of GPUs to allocate
+#SBATCH --mem=100G
+#SBATCH --cpus-per-task=12            # Number of CPU cores per task
+#SBATCH --job-name=train              # Job name (customize)
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=2:00:00                # Time limit hh:mm:ss (increased for evaluation)
+#SBATCH --output=/home/dpereira/lrm_planning/work/train_%A.out  # Standard output (%A expands to job ID)
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd $REPO_ROOT
+
+# Set all cache directories to scratch to avoid disk quota issues
+export SCRATCH_DIR=/scratch-shared/dpereira
+mkdir -p $SCRATCH_DIR
+
+# HuggingFace cache
+export HF_HOME=$SCRATCH_DIR/hf_cache
+export TRANSFORMERS_CACHE=$SCRATCH_DIR/transformers
+export HF_DATASETS_CACHE=$SCRATCH_DIR/datasets
+mkdir -p $HF_HOME $TRANSFORMERS_CACHE $HF_DATASETS_CACHE
+
+# PyTorch/Triton compilation caches
+export TORCH_HOME=$SCRATCH_DIR/torch_cache
+export TRITON_CACHE_DIR=$SCRATCH_DIR/triton_cache
+mkdir -p $TORCH_HOME $TRITON_CACHE_DIR
+
+# General XDG cache
+export XDG_CACHE_HOME=$SCRATCH_DIR/cache
+mkdir -p $XDG_CACHE_HOME
+
+python train.py \
+  --num_train_problems 10 \
+  --num_eval_problems 10 \
+  --save_steps 9 \
+  --logging_steps 1 \
+  --cache_dir /scratch-shared/dpereira \
+  --max_new_tokens 4096 \
+  --num_samples 2
+
+
+

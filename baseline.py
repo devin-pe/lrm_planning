@@ -12,6 +12,7 @@ from typing import Dict, List
 from datetime import datetime
 from openai import OpenAI
 from planning import TowersOfHanoiDataset, TowersOfHanoiValidator
+from prompts import create_standard_prompt
 
 
 # ============================================================================
@@ -45,10 +46,11 @@ client = OpenAI(
 
 
 # ============================================================================
-# Prompt Template
+# Prompt Template (imported from prompts.py)
 # ============================================================================
+# create_standard_prompt is now imported from prompts.py to avoid duplication
 
-def create_prompt(problem: Dict) -> str:
+def create_prompt(problem: Dict) -> Tuple[str, str]:
     """
     Create the prompt for DeepSeek R1 based on the problem.
     
@@ -56,60 +58,13 @@ def create_prompt(problem: Dict) -> str:
         problem: Dictionary containing problem details from TowersOfHanoiDataset
         
     Returns:
-        Formatted prompt string
+        Tuple of (system_prompt, user_prompt)
     """
     num_disks = problem['num_disks']
     goal_peg = problem['goal_peg']
     
-    # System prompt (constant) - matches reference SYSTEM_PROMPT
-    system_prompt = """You are a helpful assistant. Solve this puzzle for me.
-There are three pegs and n disks of different sizes stacked on the first peg.
-The disks are numbered from 1 (smallest) to n (largest). Disk moves in this puzzle should follow:
-1. Only one disk can be moved at a time.
-2. Each move consists of taking the upper disk from one stack and placing it on top of another stack.
-3. A larger disk may not be placed on top of a smaller disk.
-The goal is to move the entire stack to the third peg.
-
-Example: With 3 disks numbered 1 (smallest), 2, and 3 (largest), the initial state is [[3, 2, 1], [], []], and a solution might be:
-
-moves = [[1 , 0, 2], [2, 0, 1], [1, 2, 1], [3, 0, 2], [1, 1, 0], [2, 1, 2], [1, 0, 2]]
-
-This means: Move disk 1 from peg 0 to peg 2, then move disk 2 from peg 0 to peg 1, and so on.
-
-Requirements:
-• When exploring potential solutions in your thinking process, always include the corresponding
-complete list of moves.
-• The positions are 0-indexed (the leftmost peg is 0).
-• Ensure your final answer includes the complete list of moves in the format: moves = [[disk id, from peg, to peg], ...]"""
-    
-    # User prompt (changes with each problem) - matches reference USER_PROMPT format
-    # Generate the state strings
-    if num_disks == 1:
-        state = "1 (top)"
-    else:
-        stack = list(range(num_disks, 0, -1))
-        state = ", ".join([f"{stack[0]} (bottom)"] + list(map(str, stack[1:-1]))) + f", {stack[-1]} (top)"
-    
-    user_prompt = f"""I have a puzzle with {num_disks} disks of different sizes with
-Initial configuration:
-• Peg 0: {state}
-• Peg 1: (empty)
-• Peg 2: (empty)
-
-Goal configuration:
-• Peg 0: (empty)
-• Peg 1: (empty)
-• Peg 2: {state}
-
-Rules:
-• Only one disk can be moved at a time.
-• Only the top disk from any stack can be moved.
-• A larger disk may not be placed on top of a smaller disk.
-
-Find the sequence of moves to transform the initial configuration into the goal configuration."""
-    
-    # Return as separate prompts (not concatenated)
-    return system_prompt, user_prompt
+    # Use shared function from prompts.py
+    return create_standard_prompt(num_disks, goal_peg)
 
 
 # ============================================================================

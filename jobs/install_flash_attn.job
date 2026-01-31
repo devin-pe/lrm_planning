@@ -1,0 +1,48 @@
+#!/bin/bash
+#SBATCH --partition=gpu_a100       
+#SBATCH --gres=gpu:1                  
+#SBATCH -t 03:00:00
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=8
+#SBATCH --job-name=install_flash_attn
+#SBATCH --output=/home/dpereira/lrm_planning/work/install_flash_attn_%A.out
+
+# Load modules - need CUDA for nvcc (12.8 matches PyTorch cuda version)
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+
+# Activate the correct environment
+source /home/dpereira/lrm_planning/env/bin/activate
+
+# Check nvcc is available
+echo "Checking nvcc..."
+which nvcc
+nvcc --version
+
+# Check torch cuda version
+echo "Checking PyTorch CUDA version..."
+python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA version: {torch.version.cuda}')"
+
+# Install dependencies for flash-attention (including wheel)
+pip install --upgrade pip wheel packaging ninja einops setuptools
+
+# Clone and build flash-attention
+cd /home/dpereira/lrm_planning
+rm -rf flash-attention  # Clean any previous attempt
+
+echo "Cloning flash-attention..."
+git clone https://github.com/Dao-AILab/flash-attention
+cd flash-attention
+
+# Build and install (this takes a while)
+# Use --no-build-isolation so it can find torch in the environment
+echo "Building flash-attention..."
+MAX_JOBS=8 pip install . --no-build-isolation
+
+# Test the installation
+echo "Testing flash-attention installation..."
+python -c "import flash_attn; print(f'Flash Attention version: {flash_attn.__version__}')"
+
+echo "Installation complete!"

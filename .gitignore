@@ -1,2 +1,5 @@
 baseline_results/
 work/
+baseline_env/
+env/
+flash-attention/

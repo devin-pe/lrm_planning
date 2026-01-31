@@ -1,0 +1,20 @@
+{
+  "step": 4,
+  "batch_idx": 0,
+  "num_disks": 3,
+  "num_samples": 2,
+  "rewards": [
+    1.5,
+    1.5
+  ],
+  "solved": [
+    true,
+    true
+  ],
+  "violations": [
+    0,
+    0
+  ],
+  "mean_reward": 1.5,
+  "solved_rate": 1.0
+}

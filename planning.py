@@ -367,6 +367,117 @@ class TowersOfHanoiValidator:
         return torch.tensor(rewards), torch.tensor(violations)
 
 
+class NonStandardValidator:
+    """
+    Validates solutions for non-standard TOH configurations.
+    
+    Unlike the standard validator, this handles arbitrary initial and goal states,
+    not just the canonical "all disks on peg 0 -> all disks on peg 2" configuration.
+    """
+    
+    def __init__(self):
+        self.move_pattern = re.compile(
+            r'moves\s*=\s*(\[(?:\s*\[[^\]]+\]\s*,?\s*)+\])',
+            re.DOTALL
+        )
+    
+    def parse_moves(self, response: str) -> Optional[List[List[int]]]:
+        """Extract moves array from response."""
+        import json
+        matches = self.move_pattern.findall(response)
+        if not matches:
+            return None
+        
+        moves_str = matches[-1].strip()
+        try:
+            moves = json.loads(moves_str)
+            return moves
+        except json.JSONDecodeError:
+            return None
+    
+    def validate(
+        self, 
+        response: str, 
+        initial_state: List[List[int]], 
+        goal_state: List[List[int]],
+        num_disks: int
+    ) -> Dict:
+        """
+        Validate a solution for non-standard configuration.
+        
+        Args:
+            response: Model's response containing moves
+            initial_state: Starting configuration [[peg0], [peg1], [peg2]]
+            goal_state: Target configuration [[peg0], [peg1], [peg2]]
+            num_disks: Number of disks in the puzzle
+        
+        Returns:
+            Dict with validation results:
+                - success: bool (whether parsing succeeded)
+                - violations: int (number of rule violations)
+                - num_moves: int (number of moves in solution)
+                - solved: bool (whether goal state was reached)
+                - final_state: List[List[int]] (state after applying moves)
+                - error: str (error message if parsing failed)
+        """
+        moves = self.parse_moves(response)
+        
+        if moves is None:
+            return {
+                'success': False,
+                'error': 'Failed to parse moves',
+                'violations': 1,
+                'num_moves': 0,
+                'solved': False,
+            }
+        
+        # Simulate the moves
+        state = [peg.copy() for peg in initial_state]
+        violations = 0
+        
+        for i, move in enumerate(moves):
+            if len(move) != 3:
+                violations += 1
+                continue
+            
+            disk, from_peg, to_peg = move
+            
+            # Validate disk number
+            if disk < 1 or disk > num_disks:
+                violations += 1
+                continue
+            
+            # Validate peg numbers
+            if from_peg < 0 or from_peg > 2 or to_peg < 0 or to_peg > 2:
+                violations += 1
+                continue
+            
+            # Check source peg has the disk on top
+            if not state[from_peg] or state[from_peg][-1] != disk:
+                violations += 1
+                continue
+            
+            # Check destination peg constraint
+            if state[to_peg] and state[to_peg][-1] < disk:
+                violations += 1
+                continue
+            
+            # Apply the move
+            state[from_peg].pop()
+            state[to_peg].append(disk)
+        
+        # Check if goal reached
+        solved = state == goal_state
+        
+        return {
+            'success': True,
+            'violations': violations,
+            'num_moves': len(moves),
+            'solved': solved,
+            'final_state': state,
+        }
+
+
 class TowersOfHanoiDataset:
     """Generates Towers of Hanoi problems and expert solutions."""
     

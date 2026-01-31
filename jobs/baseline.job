@@ -1,7 +1,7 @@
 #!/bin/bash
 
-#SBATCH --partition=gpu_a100          # Partition name
-#SBATCH --gres=gpu:2                  # Number of GPUs to allocate
+#SBATCH --partition=gpu_h100          # Partition name
+#SBATCH --gres=gpu:1                  # Number of GPUs to allocate
 #SBATCH --cpus-per-task=24            # Number of CPU cores per task
 #SBATCH --mem=200G
 #SBATCH --job-name=baseline_deepseek_r1 # Job name (customize)
@@ -10,9 +10,9 @@
 #SBATCH --output=/home/dpereira/lrm_planning/work/baseline_%A.out  # Standard output (%A expands to job ID)
 
 module purge
-module load 2025
-module load Python/3.13.1-GCCcore-14.2.0
-source /home/dpereira/lrm_planning/reasoning_env/bin/activate
+module load 2023
+module load Python/3.11.3-GCCcore-12.3.0
+source /home/dpereira/lrm_planning/env/bin/activate
 
 # Set all cache directories to scratch to avoid disk quota issues
 export SCRATCH_DIR=/scratch-shared/dpereira
@@ -42,8 +42,6 @@ export VLLM_NO_USAGE_STATS=1
 REPO_ROOT=/home/dpereira/lrm_planning
 cd $REPO_ROOT
 
-# Create work directory for server logs
-mkdir -p work
 
 # Start vllm server in the background
 echo "Starting vllm server..."
