@@ -3,3 +3,6 @@ work/
 baseline_env/
 env/
 flash-attention/
+training_outputs/
+.env
+jobs/

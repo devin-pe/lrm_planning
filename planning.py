@@ -5,12 +5,46 @@ This module implements:
 1. TowersOfHanoiValidator: Validates reasoning traces and computes rewards
 2. TowersOfHanoiSolver: Generates optimal solutions for supervision
 3. State tracking and constraint checking for the Towers of Hanoi domain
+4. MoveParser: Parses moves from reasoning traces
+5. ConstraintChecker: Checks Towers of Hanoi constraints
+6. TOHDataset: Training dataset for GRPO
 """
 
 import re
+import json
+import random
 from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
 import torch
+from torch.utils.data import Dataset
 from copy import deepcopy
+
+from prompts import create_standard_prompt
+
+
+# ============================================================================
+# Violation Types for Constraint Loss
+# ============================================================================
+
+class ViolationType:
+    """Enumeration of Towers of Hanoi rule violations."""
+    DISK_NOT_ON_TOP = "disk_not_on_top"
+    SOURCE_PEG_EMPTY = "source_peg_empty"
+    LARGER_ON_SMALLER = "larger_on_smaller"
+    INVALID_DISK_NUMBER = "invalid_disk_number"
+    INVALID_PEG_NUMBER = "invalid_peg_number"
+    INVALID_MOVE_FORMAT = "invalid_move_format"
+    DISK_NOT_EXISTS = "disk_not_exists"
+
+
+@dataclass
+class MoveViolation:
+    """Represents a constraint violation for a move."""
+    violation_type: str
+    move: Optional[List[int]]
+    step_index: int
+    description: str
+    severity: float = 1.0  # Weight for the violation
 
 
 class TowersOfHanoiState:
@@ -237,27 +271,31 @@ class TowersOfHanoiValidator:
     
     def parse_moves(self, reasoning_trace: str) -> List[List[int]]:
         """
-        Extract moves from reasoning trace.
-        Handles both single-line and multi-line formatted arrays.
+        Extract moves from the final answer (outside <think> tags).
+        
+        DeepSeek R1 models use <think>...</think> for reasoning. The final answer
+        with moves = [[disk id, from peg, to peg], ...] should appear AFTER </think>.
         
         Returns:
             List of [disk, from_peg, to_peg] moves (all integers, 0-indexed)
         """
         import json
         
-        # Find the moves array - handle both compact and pretty-printed formats
-        # Pattern matches: moves = [ ... ] with optional whitespace and newlines
-        pattern = r'moves\s*=\s*(\[[^\]]*\](?:\s*,?\s*\n?\s*\])?)'
+        moves_pattern = r'moves\s*=\s*(\[(?:\s*\[[^\]]+\]\s*,?\s*)+\])'
         
-        # Try to find array with nested brackets first
-        candidates = re.findall(r'moves\s*=\s*(\[(?:\s*\[[^\]]+\]\s*,?\s*)+\])', reasoning_trace, re.DOTALL)
+        # Remove content inside <think>...</think> tags to get only the final answer
+        text_outside_think = re.sub(r'<think>.*?</think>', '', reasoning_trace, flags=re.DOTALL)
+        
+        # Look for moves = [[...]] in the final answer (outside think tags)
+        candidates = re.findall(moves_pattern, text_outside_think, re.DOTALL)
         
         if len(candidates) == 0:
             raise ValueError(
-                "No moves found in solution. Expected format: moves = [[disk id, from peg, to peg], ...]"
+                "No moves found in final answer (outside <think> tags). "
+                "Expected format: moves = [[disk id, from peg, to peg], ...]"
             )
         
-        # Clean up the matched string and parse
+        # Take the last occurrence in case there are multiple
         moves_str = candidates[-1].strip()
         # Remove any trailing text after the final ]
         moves_str = re.sub(r'\]\s*[^\]]*$', ']', moves_str)
@@ -531,6 +569,312 @@ Please provide the sequence of moves to solve this puzzle."""
     def generate_batch(self, batch_size: int) -> List[Dict]:
         """Generate a batch of problems."""
         return [self.generate_problem() for _ in range(batch_size)]
+
+
+# ============================================================================
+# Move Parser and Constraint Checker
+# ============================================================================
+
+class MoveParser:
+    """Parses moves from reasoning traces and checks constraints."""
+    
+    def __init__(self):
+        # Pattern for extracting individual moves during reasoning
+        # Matches patterns like: "Move disk 1 from peg 0 to peg 2"
+        self.move_patterns = [
+            # Pattern: "Move disk X from peg Y to peg Z"
+            re.compile(
+                r'[Mm]ove\s+[Dd]isk\s+(\d+)\s+from\s+[Pp]eg\s+(\d+)\s+to\s+[Pp]eg\s+(\d+)',
+                re.IGNORECASE
+            ),
+            # Pattern: "[disk, from, to]" or "[X, Y, Z]"
+            re.compile(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]'),
+            # Pattern: "disk X: Y -> Z" or "disk X from Y to Z"
+            re.compile(r'[Dd]isk\s+(\d+)[:\s]+(\d+)\s*(?:->|→|to)\s*(\d+)'),
+        ]
+        
+        # Pattern for final moves array
+        self.final_moves_pattern = re.compile(
+            r'moves\s*=\s*(\[(?:\s*\[[^\]]+\]\s*,?\s*)+\])',
+            re.DOTALL
+        )
+    
+    def parse_final_moves(self, text: str) -> Optional[List[List[int]]]:
+        """
+        Parse the final moves array from the solution (outside <think> tags).
+        
+        DeepSeek R1 models output reasoning in <think>...</think> tags.
+        The final answer should appear AFTER </think>.
+        
+        Returns:
+            List of [disk, from_peg, to_peg] or None if not found
+        """
+        # Remove content inside <think>...</think> tags
+        text_outside_think = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        
+        # Look for moves in the final answer only
+        matches = self.final_moves_pattern.findall(text_outside_think)
+        if not matches:
+            return None
+        
+        moves_str = matches[-1].strip()
+        try:
+            moves = json.loads(moves_str)
+            return moves
+        except json.JSONDecodeError:
+            return None
+    
+    def parse_intermediate_moves(self, text: str) -> List[Tuple[int, List[int]]]:
+        """
+        Parse all moves mentioned in the reasoning trace.
+        
+        Returns:
+            List of (position_in_text, [disk, from_peg, to_peg])
+        """
+        moves = []
+        
+        for pattern in self.move_patterns:
+            for match in pattern.finditer(text):
+                try:
+                    disk = int(match.group(1))
+                    from_peg = int(match.group(2))
+                    to_peg = int(match.group(3))
+                    moves.append((match.start(), [disk, from_peg, to_peg]))
+                except (ValueError, IndexError):
+                    continue
+        
+        # Sort by position in text
+        moves.sort(key=lambda x: x[0])
+        return moves
+    
+    def extract_reasoning_moves(self, text: str) -> List[List[int]]:
+        """
+        Extract all moves from reasoning (thinking) section.
+        
+        Returns:
+            Ordered list of moves found in reasoning
+        """
+        # Extract thinking section if present
+        think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
+        if think_match:
+            reasoning = think_match.group(1)
+        else:
+            reasoning = text
+        
+        intermediate = self.parse_intermediate_moves(reasoning)
+        return [move for _, move in intermediate]
+
+
+class ConstraintChecker:
+    """Checks Towers of Hanoi constraints and computes violation penalties."""
+    
+    def __init__(self, num_disks: int):
+        self.num_disks = num_disks
+        self.initial_state = TowersOfHanoiState(num_disks)
+    
+    def check_move(
+        self, 
+        move: List[int], 
+        state: TowersOfHanoiState,
+        step_index: int
+    ) -> List[MoveViolation]:
+        """
+        Check a single move for constraint violations.
+        
+        Args:
+            move: [disk, from_peg, to_peg]
+            state: Current state before the move
+            step_index: Index of this move in the sequence
+            
+        Returns:
+            List of violations found
+        """
+        violations = []
+        
+        # Check move format
+        if len(move) != 3:
+            violations.append(MoveViolation(
+                violation_type=ViolationType.INVALID_MOVE_FORMAT,
+                move=move,
+                step_index=step_index,
+                description=f"Move must have 3 elements, got {len(move)}",
+                severity=1.0
+            ))
+            return violations
+        
+        disk, from_peg, to_peg = move
+        
+        # Check disk number validity
+        if not isinstance(disk, int) or disk < 1 or disk > self.num_disks:
+            violations.append(MoveViolation(
+                violation_type=ViolationType.INVALID_DISK_NUMBER,
+                move=move,
+                step_index=step_index,
+                description=f"Invalid disk number {disk}, must be 1-{self.num_disks}",
+                severity=1.0
+            ))
+            return violations
+        
+        # Check peg number validity
+        if not isinstance(from_peg, int) or from_peg < 0 or from_peg > 2:
+            violations.append(MoveViolation(
+                violation_type=ViolationType.INVALID_PEG_NUMBER,
+                move=move,
+                step_index=step_index,
+                description=f"Invalid source peg {from_peg}, must be 0-2",
+                severity=1.0
+            ))
+            return violations
+        
+        if not isinstance(to_peg, int) or to_peg < 0 or to_peg > 2:
+            violations.append(MoveViolation(
+                violation_type=ViolationType.INVALID_PEG_NUMBER,
+                move=move,
+                step_index=step_index,
+                description=f"Invalid destination peg {to_peg}, must be 0-2",
+                severity=1.0
+            ))
+            return violations
+        
+        # Check source peg is not empty
+        if len(state.pegs[from_peg]) == 0:
+            violations.append(MoveViolation(
+                violation_type=ViolationType.SOURCE_PEG_EMPTY,
+                move=move,
+                step_index=step_index,
+                description=f"Source peg {from_peg} is empty",
+                severity=1.0
+            ))
+            return violations
+        
+        # Check the disk is on top of the source peg
+        top_disk = state.pegs[from_peg][-1]
+        if top_disk != disk:
+            violations.append(MoveViolation(
+                violation_type=ViolationType.DISK_NOT_ON_TOP,
+                move=move,
+                step_index=step_index,
+                description=f"Disk {disk} is not on top of peg {from_peg}, top disk is {top_disk}",
+                severity=1.0
+            ))
+            return violations
+        
+        # Check destination peg constraint (larger disk on smaller)
+        if len(state.pegs[to_peg]) > 0:
+            top_dest = state.pegs[to_peg][-1]
+            if disk > top_dest:
+                violations.append(MoveViolation(
+                    violation_type=ViolationType.LARGER_ON_SMALLER,
+                    move=move,
+                    step_index=step_index,
+                    description=f"Cannot place disk {disk} on smaller disk {top_dest}",
+                    severity=1.0
+                ))
+        
+        return violations
+    
+    def check_move_sequence(
+        self, 
+        moves: List[List[int]]
+    ) -> Tuple[List[MoveViolation], TowersOfHanoiState]:
+        """
+        Check a sequence of moves for constraint violations.
+        
+        Args:
+            moves: List of [disk, from_peg, to_peg] moves
+            
+        Returns:
+            Tuple of (all_violations, final_state)
+        """
+        state = self.initial_state.copy()
+        all_violations = []
+        
+        for i, move in enumerate(moves):
+            violations = self.check_move(move, state, i)
+            all_violations.extend(violations)
+            
+            # Apply move if valid (for state tracking)
+            if not violations and len(move) == 3:
+                disk, from_peg, to_peg = move
+                if (len(state.pegs[from_peg]) > 0 and 
+                    state.pegs[from_peg][-1] == disk):
+                    state.pegs[from_peg].pop()
+                    state.pegs[to_peg].append(disk)
+        
+        return all_violations, state
+    
+    def compute_violation_score(self, violations: List[MoveViolation]) -> float:
+        """
+        Compute a normalized violation score.
+        
+        Returns:
+            Score in [0, 1] where 0 = no violations, 1 = many violations
+        """
+        if not violations:
+            return 0.0
+        
+        total_severity = sum(v.severity for v in violations)
+        # Normalize by expected number of moves (2^n - 1)
+        expected_moves = 2 ** self.num_disks - 1
+        normalized = total_severity / max(expected_moves, 1)
+        return min(normalized, 1.0)
+
+
+# ============================================================================
+# GRPO Training Dataset
+# ============================================================================
+
+class TOHDataset(Dataset):
+    """Dataset for Towers of Hanoi GRPO training with equal disk proportions."""
+    
+    def __init__(
+        self, 
+        num_problems: int,
+        min_disks: int = 3,
+        max_disks: int = 5,
+    ):
+        self.num_problems = num_problems
+        self.min_disks = min_disks
+        self.max_disks = max_disks
+        
+        # Pre-generate problems
+        self.problems = self._generate_problems()
+    
+    def _generate_problems(self) -> List[Dict]:
+        """Generate problems with equal proportions of each disk count."""
+        problems = []
+        dataset = TowersOfHanoiDataset(self.min_disks, self.max_disks)
+        
+        # Equal distribution across disk counts
+        disk_counts = list(range(self.min_disks, self.max_disks + 1))
+        num_per_disk = self.num_problems // len(disk_counts)
+        remainder = self.num_problems % len(disk_counts)
+        
+        for i, num_disks in enumerate(disk_counts):
+            # Distribute remainder across first few disk counts
+            count = num_per_disk + (1 if i < remainder else 0)
+            
+            for _ in range(count):
+                problem = dataset.generate_problem(num_disks=num_disks)
+                system_prompt, user_prompt = create_standard_prompt(num_disks)
+                
+                problems.append({
+                    'num_disks': num_disks,
+                    'goal_peg': 2,
+                    'system_prompt': system_prompt,
+                    'user_prompt': user_prompt,
+                    'optimal_moves': 2 ** num_disks - 1,
+                })
+        
+        # Shuffle to avoid ordered training
+        random.shuffle(problems)
+        return problems
+    
+    def __len__(self) -> int:
+        return self.num_problems
+    
+    def __getitem__(self, idx: int) -> Dict:
+        return self.problems[idx]
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from typing import List
 class TrainingConfig:
     """Training configuration for GRPO + Constraint Loss."""
     # Model
-    model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+    model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
     
     # Problem distribution
     min_disks: int = 3
@@ -23,7 +23,7 @@ class TrainingConfig:
     # GRPO settings
     num_samples_per_prompt: int = 4  # Group size for GRPO
     temperature: float = 1.0
-    max_new_tokens: int = 4096
+    max_new_tokens: int = 16384
     
     # Training hyperparameters
     learning_rate: float = 1e-5

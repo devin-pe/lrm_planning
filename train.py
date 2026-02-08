@@ -1,9 +1,10 @@
 """
 GRPO Training Script for Towers of Hanoi with Constraint Loss
 
-This script trains DeepSeek-R1-Distill-Qwen-32B on Towers of Hanoi using:
+This script trains DeepSeek-R1-Distill-Qwen on Towers of Hanoi using:
 1. GRPO (Group Relative Policy Optimization) for policy improvement
 2. Constraint loss to penalize rule violations during reasoning
+3. vLLM for fast rollout generation (10-20x speedup)
 
 The constraint loss ensures:
 - The chosen disk to move is on top of its peg
@@ -20,7 +21,6 @@ import random
 import argparse
 from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime
-from dataclasses import dataclass, field
 from copy import deepcopy
 
 import torch
@@ -36,282 +36,151 @@ from peft import LoraConfig, get_peft_model
 from accelerate import Accelerator
 from tqdm import tqdm
 
-from planning import TowersOfHanoiDataset, TowersOfHanoiValidator, TowersOfHanoiState
+from planning import (
+    TowersOfHanoiDataset, 
+    TowersOfHanoiValidator, 
+    TowersOfHanoiState,
+    ViolationType,
+    MoveViolation,
+    MoveParser,
+    ConstraintChecker,
+    TOHDataset,
+)
 from config import TrainingConfig
 from prompts import create_standard_prompt
 
-
-# ============================================================================
-# Violation Types for Constraint Loss
-# ============================================================================
-
-class ViolationType:
-    """Enumeration of Towers of Hanoi rule violations."""
-    DISK_NOT_ON_TOP = "disk_not_on_top"
-    SOURCE_PEG_EMPTY = "source_peg_empty"
-    LARGER_ON_SMALLER = "larger_on_smaller"
-    INVALID_DISK_NUMBER = "invalid_disk_number"
-    INVALID_PEG_NUMBER = "invalid_peg_number"
-    INVALID_MOVE_FORMAT = "invalid_move_format"
-    DISK_NOT_EXISTS = "disk_not_exists"
-
-
-@dataclass
-class MoveViolation:
-    """Represents a constraint violation for a move."""
-    violation_type: str
-    move: Optional[List[int]]
-    step_index: int
-    description: str
-    severity: float = 1.0  # Weight for the violation
+# vLLM import - optional, will be imported when needed
+try:
+    from vllm import LLM, SamplingParams
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
 
 
 # ============================================================================
-# Prompt Creation (imported from prompts.py)
-# ============================================================================
-# create_standard_prompt is now imported from prompts.py to avoid duplication
-
-
-# ============================================================================
-# Move Parser and Constraint Checker
+# vLLM Rollout Engine for Fast Generation
 # ============================================================================
 
-class MoveParser:
-    """Parses moves from reasoning traces and checks constraints."""
+class VLLMRolloutEngine:
+    """
+    Fast rollout engine using vLLM for 10-20x faster generation.
     
-    def __init__(self):
-        # Pattern for extracting individual moves during reasoning
-        # Matches patterns like: "Move disk 1 from peg 0 to peg 2"
-        self.move_patterns = [
-            # Pattern: "Move disk X from peg Y to peg Z"
-            re.compile(
-                r'[Mm]ove\s+[Dd]isk\s+(\d+)\s+from\s+[Pp]eg\s+(\d+)\s+to\s+[Pp]eg\s+(\d+)',
-                re.IGNORECASE
-            ),
-            # Pattern: "[disk, from, to]" or "[X, Y, Z]"
-            re.compile(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]'),
-            # Pattern: "disk X: Y -> Z" or "disk X from Y to Z"
-            re.compile(r'[Dd]isk\s+(\d+)[:\s]+(\d+)\s*(?:->|→|to)\s*(\d+)'),
-        ]
+    This class wraps vLLM to provide fast parallel generation of responses
+    for GRPO training. The weights can be synced from the training model
+    periodically.
+    
+    When using with training (2 GPUs), vLLM uses GPU 1 while training uses GPU 0.
+    """
+    
+    def __init__(
+        self,
+        model_name: str,
+        tokenizer: AutoTokenizer,
+        max_new_tokens: int = 4096,
+        temperature: float = 1.0,
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.90,
+        cache_dir: Optional[str] = None,
+        vllm_gpu_id: int = 1,  # Use GPU 1 (GPU 0 is for training)
+    ):
+        if not VLLM_AVAILABLE:
+            raise ImportError(
+                "vLLM is not installed. Install it with: pip install vllm"
+            )
         
-        # Pattern for final moves array
-        self.final_moves_pattern = re.compile(
-            r'moves\s*=\s*(\[(?:\s*\[[^\]]+\]\s*,?\s*)+\])',
-            re.DOTALL
+        self.model_name = model_name
+        self.tokenizer = tokenizer
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        
+        # Initialize vLLM engine on specified GPU
+        print(f"Initializing vLLM engine with {model_name} on GPU {vllm_gpu_id}...")
+        
+        # Set environment to restrict vLLM to specific GPU
+        import os
+        old_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(vllm_gpu_id)
+        
+        self.llm = LLM(
+            model=model_name,
+            trust_remote_code=True,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=32768,  # Max context for DeepSeek models
+            download_dir=cache_dir,
+            dtype="bfloat16",
         )
-    
-    def parse_final_moves(self, text: str) -> Optional[List[List[int]]]:
-        """
-        Parse the final moves array from the solution.
         
-        Returns:
-            List of [disk, from_peg, to_peg] or None if not found
-        """
-        matches = self.final_moves_pattern.findall(text)
-        if not matches:
-            return None
-        
-        moves_str = matches[-1].strip()
-        try:
-            moves = json.loads(moves_str)
-            return moves
-        except json.JSONDecodeError:
-            return None
-    
-    def parse_intermediate_moves(self, text: str) -> List[Tuple[int, List[int]]]:
-        """
-        Parse all moves mentioned in the reasoning trace.
-        
-        Returns:
-            List of (position_in_text, [disk, from_peg, to_peg])
-        """
-        moves = []
-        
-        for pattern in self.move_patterns:
-            for match in pattern.finditer(text):
-                try:
-                    disk = int(match.group(1))
-                    from_peg = int(match.group(2))
-                    to_peg = int(match.group(3))
-                    moves.append((match.start(), [disk, from_peg, to_peg]))
-                except (ValueError, IndexError):
-                    continue
-        
-        # Sort by position in text
-        moves.sort(key=lambda x: x[0])
-        return moves
-    
-    def extract_reasoning_moves(self, text: str) -> List[List[int]]:
-        """
-        Extract all moves from reasoning (thinking) section.
-        
-        Returns:
-            Ordered list of moves found in reasoning
-        """
-        # Extract thinking section if present
-        think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
-        if think_match:
-            reasoning = think_match.group(1)
+        # Restore CUDA_VISIBLE_DEVICES
+        if old_cuda_visible is not None:
+            os.environ['CUDA_VISIBLE_DEVICES'] = old_cuda_visible
         else:
-            reasoning = text
+            del os.environ['CUDA_VISIBLE_DEVICES']
         
-        intermediate = self.parse_intermediate_moves(reasoning)
-        return [move for _, move in intermediate]
-
-
-class ConstraintChecker:
-    """Checks Towers of Hanoi constraints and computes violation penalties."""
+        # Default sampling parameters
+        self.sampling_params = SamplingParams(
+            temperature=temperature,
+            max_tokens=max_new_tokens,
+            top_p=0.95,
+        )
+        print("vLLM engine initialized successfully!")
     
-    def __init__(self, num_disks: int):
-        self.num_disks = num_disks
-        self.initial_state = TowersOfHanoiState(num_disks)
-    
-    def check_move(
-        self, 
-        move: List[int], 
-        state: TowersOfHanoiState,
-        step_index: int
-    ) -> List[MoveViolation]:
+    def generate(
+        self,
+        prompts: List[Dict],
+        num_samples: int,
+    ) -> List[List[str]]:
         """
-        Check a single move for constraint violations.
+        Generate multiple responses per prompt using vLLM.
         
         Args:
-            move: [disk, from_peg, to_peg]
-            state: Current state before the move
-            step_index: Index of this move in the sequence
+            prompts: List of prompt dictionaries with 'system_prompt' and 'user_prompt'
+            num_samples: Number of responses to generate per prompt
             
         Returns:
-            List of violations found
+            List of lists, where each inner list has num_samples responses
         """
-        violations = []
+        # Format all prompts
+        formatted_prompts = []
+        for prompt_data in prompts:
+            messages = [
+                {"role": "system", "content": prompt_data['system_prompt']},
+                {"role": "user", "content": prompt_data['user_prompt']}
+            ]
+            formatted = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            # Repeat for num_samples
+            formatted_prompts.extend([formatted] * num_samples)
         
-        # Check move format
-        if len(move) != 3:
-            violations.append(MoveViolation(
-                violation_type=ViolationType.INVALID_MOVE_FORMAT,
-                move=move,
-                step_index=step_index,
-                description=f"Move must have 3 elements, got {len(move)}",
-                severity=1.0
-            ))
-            return violations
+        # Generate all at once (vLLM batches internally)
+        outputs = self.llm.generate(formatted_prompts, self.sampling_params)
         
-        disk, from_peg, to_peg = move
+        # Organize results
+        all_responses = []
+        idx = 0
+        for _ in prompts:
+            responses = []
+            for _ in range(num_samples):
+                response_text = outputs[idx].outputs[0].text
+                responses.append(response_text)
+                idx += 1
+            all_responses.append(responses)
         
-        # Check disk number validity
-        if not isinstance(disk, int) or disk < 1 or disk > self.num_disks:
-            violations.append(MoveViolation(
-                violation_type=ViolationType.INVALID_DISK_NUMBER,
-                move=move,
-                step_index=step_index,
-                description=f"Invalid disk number {disk}, must be 1-{self.num_disks}",
-                severity=1.0
-            ))
-            return violations
-        
-        # Check peg number validity
-        if not isinstance(from_peg, int) or from_peg < 0 or from_peg > 2:
-            violations.append(MoveViolation(
-                violation_type=ViolationType.INVALID_PEG_NUMBER,
-                move=move,
-                step_index=step_index,
-                description=f"Invalid source peg {from_peg}, must be 0-2",
-                severity=1.0
-            ))
-            return violations
-        
-        if not isinstance(to_peg, int) or to_peg < 0 or to_peg > 2:
-            violations.append(MoveViolation(
-                violation_type=ViolationType.INVALID_PEG_NUMBER,
-                move=move,
-                step_index=step_index,
-                description=f"Invalid destination peg {to_peg}, must be 0-2",
-                severity=1.0
-            ))
-            return violations
-        
-        # Check source peg is not empty
-        if len(state.pegs[from_peg]) == 0:
-            violations.append(MoveViolation(
-                violation_type=ViolationType.SOURCE_PEG_EMPTY,
-                move=move,
-                step_index=step_index,
-                description=f"Source peg {from_peg} is empty",
-                severity=1.0
-            ))
-            return violations
-        
-        # Check the disk is on top of the source peg
-        top_disk = state.pegs[from_peg][-1]
-        if top_disk != disk:
-            violations.append(MoveViolation(
-                violation_type=ViolationType.DISK_NOT_ON_TOP,
-                move=move,
-                step_index=step_index,
-                description=f"Disk {disk} is not on top of peg {from_peg}, top disk is {top_disk}",
-                severity=1.0
-            ))
-            return violations
-        
-        # Check destination peg constraint (larger disk on smaller)
-        if len(state.pegs[to_peg]) > 0:
-            top_dest = state.pegs[to_peg][-1]
-            if disk > top_dest:
-                violations.append(MoveViolation(
-                    violation_type=ViolationType.LARGER_ON_SMALLER,
-                    move=move,
-                    step_index=step_index,
-                    description=f"Cannot place disk {disk} on smaller disk {top_dest}",
-                    severity=1.0
-                ))
-        
-        return violations
+        return all_responses
     
-    def check_move_sequence(
-        self, 
-        moves: List[List[int]]
-    ) -> Tuple[List[MoveViolation], TowersOfHanoiState]:
+    def update_weights(self, model: nn.Module):
         """
-        Check a sequence of moves for constraint violations.
+        Sync weights from training model to vLLM engine.
         
-        Args:
-            moves: List of [disk, from_peg, to_peg] moves
-            
-        Returns:
-            Tuple of (all_violations, final_state)
+        Note: This is a simplified version. For production, you'd want to use
+        vLLM's weight update API or save/reload the model.
         """
-        state = self.initial_state.copy()
-        all_violations = []
-        
-        for i, move in enumerate(moves):
-            violations = self.check_move(move, state, i)
-            all_violations.extend(violations)
-            
-            # Apply move if valid (for state tracking)
-            if not violations and len(move) == 3:
-                disk, from_peg, to_peg = move
-                if (len(state.pegs[from_peg]) > 0 and 
-                    state.pegs[from_peg][-1] == disk):
-                    state.pegs[from_peg].pop()
-                    state.pegs[to_peg].append(disk)
-        
-        return all_violations, state
-    
-    def compute_violation_score(self, violations: List[MoveViolation]) -> float:
-        """
-        Compute a normalized violation score.
-        
-        Returns:
-            Score in [0, 1] where 0 = no violations, 1 = many violations
-        """
-        if not violations:
-            return 0.0
-        
-        total_severity = sum(v.severity for v in violations)
-        # Normalize by expected number of moves (2^n - 1)
-        expected_moves = 2 ** self.num_disks - 1
-        normalized = total_severity / max(expected_moves, 1)
-        return min(normalized, 1.0)
+        # For LoRA models, we need to merge and reload
+        # This is expensive, so should be done infrequently
+        pass  # TODO: Implement efficient weight sync
 
 
 # ============================================================================
@@ -371,61 +240,6 @@ class RewardComputer:
 
 
 # ============================================================================
-# GRPO Training Dataset
-# ============================================================================
-
-class TOHDataset(Dataset):
-    """Dataset for Towers of Hanoi GRPO training."""
-    
-    def __init__(
-        self, 
-        num_problems: int,
-        min_disks: int = 3,
-        max_disks: int = 5,
-        disk_weights: Optional[Dict[int, float]] = None
-    ):
-        self.num_problems = num_problems
-        self.min_disks = min_disks
-        self.max_disks = max_disks
-        self.disk_weights = disk_weights or {3: 0.4, 4: 0.35, 5: 0.25}
-        
-        # Pre-generate problems
-        self.problems = self._generate_problems()
-    
-    def _generate_problems(self) -> List[Dict]:
-        """Generate all problems for the dataset."""
-        problems = []
-        dataset = TowersOfHanoiDataset(self.min_disks, self.max_disks)
-        
-        # Sample disk counts based on weights
-        disk_counts = list(range(self.min_disks, self.max_disks + 1))
-        weights = [self.disk_weights.get(d, 1.0) for d in disk_counts]
-        total_weight = sum(weights)
-        probs = [w / total_weight for w in weights]
-        
-        for _ in range(self.num_problems):
-            num_disks = random.choices(disk_counts, weights=probs, k=1)[0]
-            problem = dataset.generate_problem(num_disks=num_disks)
-            system_prompt, user_prompt = create_standard_prompt(num_disks)
-            
-            problems.append({
-                'num_disks': num_disks,
-                'goal_peg': 2,
-                'system_prompt': system_prompt,
-                'user_prompt': user_prompt,
-                'optimal_moves': 2 ** num_disks - 1,
-            })
-        
-        return problems
-    
-    def __len__(self) -> int:
-        return self.num_problems
-    
-    def __getitem__(self, idx: int) -> Dict:
-        return self.problems[idx]
-
-
-# ============================================================================
 # GRPO Trainer with Constraint Loss
 # ============================================================================
 
@@ -435,6 +249,8 @@ class GRPOTrainer:
     
     GRPO (Group Relative Policy Optimization) samples multiple responses
     per prompt and uses relative rewards within the group for policy updates.
+    
+    Supports optional vLLM rollout engine for 10-20x faster generation.
     """
     
     def __init__(
@@ -443,11 +259,13 @@ class GRPOTrainer:
         tokenizer: AutoTokenizer,
         config: TrainingConfig,
         ref_model: Optional[nn.Module] = None,
+        vllm_engine: Optional[VLLMRolloutEngine] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
         self.ref_model = ref_model
+        self.vllm_engine = vllm_engine
         
         self.validator = TowersOfHanoiValidator()
         self.reward_computer = RewardComputer(self.validator)
@@ -488,9 +306,17 @@ class GRPOTrainer:
         """
         Generate multiple responses per prompt.
         
+        Uses vLLM engine if available for 10-20x faster generation,
+        otherwise falls back to standard HuggingFace generate().
+        
         Returns:
             List of lists, where each inner list has num_samples responses
         """
+        # Use vLLM if available (10-20x faster)
+        if self.vllm_engine is not None:
+            return self.vllm_engine.generate(prompts, num_samples)
+        
+        # Fallback to standard HuggingFace generation
         self.model.eval()
         all_responses = []
         
@@ -1096,10 +922,10 @@ def load_model_and_tokenizer(config: TrainingConfig):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load model in bfloat16 (no quantization for training stability)
+    # Load model in bfloat16 on GPU 0 (GPU 1 reserved for vLLM)
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        device_map="auto",
+        device_map={"":  0},
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
@@ -1132,10 +958,10 @@ def load_reference_model(config: TrainingConfig):
     # Get cache directory from environment (set in main)
     cache_dir = os.environ.get('TRANSFORMERS_CACHE', None)
     
-    # Load reference model in bfloat16 (no quantization)
+    # Load reference model in bfloat16 on GPU 0
     ref_model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        device_map="auto",
+        device_map={"":  0},
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
@@ -1208,6 +1034,12 @@ def parse_args():
     
     # Reference model
     parser.add_argument("--use_ref_model", action="store_true", default=False)
+    
+    # vLLM for fast generation
+    parser.add_argument("--use_vllm", action="store_true", default=False,
+                        help="Use vLLM for 10-20x faster generation (requires vllm package)")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.85,
+                        help="GPU memory utilization for vLLM (0.0-1.0)")
     
     return parser.parse_args()
 
@@ -1282,18 +1114,36 @@ def main():
     print("GRPO Training for Towers of Hanoi with Constraint Loss")
     print("=" * 80)
     print(f"Output directory: {config.output_dir}")
+    print(f"Using vLLM: {args.use_vllm}")
     print(f"Configuration:")
     for key, value in vars(config).items():
         print(f"  {key}: {value}")
     print("=" * 80)
     
-    # Load model
+    # Load model for training (with LoRA)
     model, tokenizer = load_model_and_tokenizer(config)
     
     # Load reference model if needed
     ref_model = None
     if args.use_ref_model and config.kl_weight > 0:
         ref_model = load_reference_model(config)
+    
+    # Initialize vLLM engine for fast generation if requested
+    vllm_engine = None
+    if args.use_vllm:
+        if not VLLM_AVAILABLE:
+            print("WARNING: vLLM requested but not available. Falling back to HuggingFace generate().")
+            print("Install vLLM with: pip install vllm")
+        else:
+            print("\nInitializing vLLM rollout engine for fast generation...")
+            vllm_engine = VLLMRolloutEngine(
+                model_name=config.model_name,
+                tokenizer=tokenizer,
+                max_new_tokens=config.max_new_tokens,
+                temperature=config.temperature,
+                gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                cache_dir=args.cache_dir,
+            )
     
     # Create datasets
     print("\nCreating datasets...")
@@ -1318,6 +1168,7 @@ def main():
         tokenizer=tokenizer,
         config=config,
         ref_model=ref_model,
+        vllm_engine=vllm_engine,
     )
     
     # Train
