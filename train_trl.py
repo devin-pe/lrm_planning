@@ -89,7 +89,7 @@ class TOHRewardFunction:
         self.validator = TowersOfHanoiValidator()
         self.move_parser = MoveParser()
         self.constraint_weight = constraint_weight
-        # Add __name__ for TRL compatibility
+        # Set callable name expected by TRL
         self.__name__ = "toh_reward"
     
     def __call__(

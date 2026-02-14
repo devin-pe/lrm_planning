@@ -5,3 +5,9 @@ vllm==0.11.0
 trl>=0.15.0
 datasets>=2.14.0
 accelerate>=0.25.0
+
+langchain>=0.3.5
+langchain-community>=0.3.5
+langchain-openai>=0.3.5
+langgraph>=0.2.0
+e2b-code-interpreter>=2.0.0

@@ -30,16 +30,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from typing_extensions import Annotated, TypedDict
+from prompts import CODE_SYSTEM_PROMPT
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 os.environ.setdefault('LANGCHAIN_PROJECT', 'code-agent')
 
-# ============================================================
-# SKILLS TOGGLE - For before/after comparison demo
-# Option 1: Set env var SKILLS_ENABLED=false in .env
-# Option 2: Change the default below
-# ============================================================
-# SKILLS_ENABLED = os.getenv('SKILLS_ENABLED', 'true').lower() == 'true'
-# ============================================================
 
 class InputState(TypedDict):
     """Minimal input schema for LangGraph Studio."""
@@ -182,41 +180,21 @@ def read_file(path: str) -> str:
 tools = [execute_python, run_shell, write_file, read_file]
 
 
-# LLM Setup
 model = ChatOpenAI(
-    openai_api_key=os.getenv('OPENAI_API_KEY'),
+    openai_api_key=os.getenv('OPENROUTER_API_KEY'),
+    openai_api_base='https://openrouter.ai/api/v1',
     temperature=0.0,
-    model='gpt-4o',
-    timeout=120,
+    model='deepseek/deepseek-r1',
+    timeout=1200,
     stream_usage=True,
 ).bind_tools(tools, parallel_tool_calls=False)
 
 
-# System Prompt
-SYSTEM_PROMPT = open('session_code_agents/prompts/code_agent_system_prompt.txt', 'r').read()
-
-
 # Graph Nodes
 def agent_node(state: State):
-    """Core LLM invocation with tools bound and skill injection."""
+    """Core LLM invocation with tools bound."""
     messages = state['messages']
-
-    # Build system prompt, potentially with skill injection
-    prompt_content = SYSTEM_PROMPT
-
-    # Detect skill from the last human message
-    last_human_msg = None
-    for msg in reversed(messages):
-        if isinstance(msg, HumanMessage):
-            last_human_msg = msg.content
-            break
-
-    if SKILLS_ENABLED and last_human_msg:
-        skill_prompt = get_skill_prompt(last_human_msg)
-        if skill_prompt:
-            prompt_content += f'\n\n## Active Skill\n\n{skill_prompt}'
-
-    sys_prompt = SystemMessage(content=prompt_content)
+    sys_prompt = SystemMessage(content=CODE_SYSTEM_PROMPT)
     response = model.invoke([sys_prompt] + messages)
     return {'messages': [response]}
 

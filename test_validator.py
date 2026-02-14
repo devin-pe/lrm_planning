@@ -46,7 +46,7 @@ def test_solver():
         
         # Verify solution is valid
         state = TowersOfHanoiState(n)
-        for from_peg, to_peg in moves:
+        for _, from_peg, to_peg in moves:
             assert state.is_valid_move(from_peg, to_peg), f"Invalid move: {from_peg}->{to_peg}"
             state.apply_move(from_peg, to_peg)
         

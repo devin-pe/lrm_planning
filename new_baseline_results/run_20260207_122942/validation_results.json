@@ -1,0 +1,122 @@
+[
+  {
+    "file": "problem_000.json",
+    "problem_id": 0,
+    "num_disks": 3,
+    "config_type": "nonstandard",
+    "parse_error": false,
+    "solved": true,
+    "violations": 0,
+    "num_moves": 4,
+    "optimal_moves": 4,
+    "is_optimal": true
+  },
+  {
+    "file": "problem_001.json",
+    "problem_id": 1,
+    "num_disks": 3,
+    "config_type": "nonstandard",
+    "parse_error": false,
+    "solved": true,
+    "violations": 0,
+    "num_moves": 3,
+    "optimal_moves": 3,
+    "is_optimal": true
+  },
+  {
+    "file": "problem_002.json",
+    "problem_id": 2,
+    "num_disks": 3,
+    "config_type": "nonstandard",
+    "parse_error": false,
+    "solved": true,
+    "violations": 0,
+    "num_moves": 4,
+    "optimal_moves": 4,
+    "is_optimal": true
+  },
+  {
+    "file": "problem_003.json",
+    "problem_id": 3,
+    "num_disks": 3,
+    "config_type": "nonstandard",
+    "parse_error": false,
+    "solved": true,
+    "violations": 0,
+    "num_moves": 9,
+    "optimal_moves": 7,
+    "is_optimal": false
+  },
+  {
+    "file": "problem_004.json",
+    "problem_id": 0,
+    "num_disks": 4,
+    "config_type": "nonstandard",
+    "parse_error": false,
+    "solved": true,
+    "violations": 0,
+    "num_moves": 6,
+    "optimal_moves": 6,
+    "is_optimal": true
+  },
+  {
+    "file": "problem_005.json",
+    "problem_id": 1,
+    "num_disks": 4,
+    "config_type": "nonstandard",
+    "parse_error": false,
+    "solved": true,
+    "violations": 0,
+    "num_moves": 7,
+    "optimal_moves": 5,
+    "is_optimal": false
+  },
+  {
+    "file": "problem_006.json",
+    "problem_id": 2,
+    "num_disks": 4,
+    "config_type": "nonstandard",
+    "parse_error": false,
+    "solved": false,
+    "violations": 3,
+    "num_moves": 4,
+    "optimal_moves": 6,
+    "is_optimal": false
+  },
+  {
+    "file": "problem_007.json",
+    "problem_id": 0,
+    "num_disks": 5,
+    "config_type": "nonstandard",
+    "parse_error": true,
+    "solved": false,
+    "violations": 1,
+    "num_moves": 0,
+    "optimal_moves": null,
+    "is_optimal": false
+  },
+  {
+    "file": "problem_008.json",
+    "problem_id": 1,
+    "num_disks": 5,
+    "config_type": "nonstandard",
+    "parse_error": false,
+    "solved": false,
+    "violations": 6,
+    "num_moves": 21,
+    "optimal_moves": 31,
+    "is_optimal": false
+  },
+  {
+    "file": "problem_009.json",
+    "problem_id": 2,
+    "num_disks": 5,
+    "config_type": "nonstandard",
+    "parse_error": false,
+    "solved": true,
+    "violations": 0,
+    "num_moves": 6,
+    "optimal_moves": 3,
+    "is_optimal": false
+  }
+]
