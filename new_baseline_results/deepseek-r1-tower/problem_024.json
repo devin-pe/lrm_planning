@@ -226,10 +226,10 @@
   },
   "validation": {
     "success": true,
-    "violations": 1,
-    "num_moves": null,
-    "solved": false,
-    "reward": 0.0
+    "violations": 0,
+    "num_moves": 31,
+    "solved": true,
+    "reward": 1.5
   },
   "elapsed_seconds": 303.1
 }

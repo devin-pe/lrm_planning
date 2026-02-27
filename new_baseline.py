@@ -265,6 +265,20 @@ def main():
         json.dump(results, f, indent=2)
 
     solved_count = sum(1 for r in results if r.get("validation", {}).get("solved", False))
+    optimal_count = sum(1 for r in results if r.get("validation", {}).get("is_optimal", False))
+    per_disk_total = {}
+    per_disk_solved = {}
+    per_disk_optimal = {}
+    for r in results:
+        disk = r.get("num_disks")
+        if disk is None:
+            continue
+        per_disk_total[disk] = per_disk_total.get(disk, 0) + 1
+        if r.get("validation", {}).get("solved", False):
+            per_disk_solved[disk] = per_disk_solved.get(disk, 0) + 1
+        if r.get("validation", {}).get("is_optimal", False):
+            per_disk_optimal[disk] = per_disk_optimal.get(disk, 0) + 1
+
     avg_violations = (
         sum(r.get("validation", {}).get("violations", 0) for r in results) / len(results)
         if results
@@ -273,6 +287,17 @@ def main():
 
     print(f"\nAll results saved to {combined_path}")
     print(f"Solved: {solved_count}/{len(results)} ({100 * solved_count / len(results):.1f}%)")
+    print(f"Optimal: {optimal_count}/{len(results)} ({100 * optimal_count / len(results):.1f}%)")
+    if per_disk_total:
+        print("Solved/Optimal by disk:")
+        for disk in sorted(per_disk_total):
+            solved = per_disk_solved.get(disk, 0)
+            optimal = per_disk_optimal.get(disk, 0)
+            total = per_disk_total[disk]
+            print(
+                f"  {disk} disks: solved {solved}/{total} ({100 * solved / total:.1f}%), "
+                f"optimal {optimal}/{total} ({100 * optimal / total:.1f}%)"
+            )
     print(f"Average violations: {avg_violations:.2f}")
 
 

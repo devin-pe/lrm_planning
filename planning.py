@@ -22,6 +22,36 @@ from torch.utils.data import Dataset
 from prompts import create_standard_prompt, create_nonstandard_prompt
 
 
+def _extract_moves_block(text: str) -> Optional[str]:
+    last_complete_block = None
+
+    for match in re.finditer(r'moves\s*=\s*\[', text, flags=re.IGNORECASE):
+        start = text.find('[', match.start())
+        if start == -1:
+            continue
+
+        depth = 0
+        for idx in range(start, len(text)):
+            char = text[idx]
+            if char == '[':
+                depth += 1
+            elif char == ']':
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:idx + 1]
+                    if candidate.strip() != '[]':
+                        last_complete_block = candidate
+                    break
+
+    return last_complete_block
+
+
+def _parse_moves_json(moves_str: str) -> List[List[int]]:
+    cleaned = re.sub(r'#[^\n]*', '', moves_str)
+    cleaned = re.sub(r',\s*\]', ']', cleaned)
+    return json.loads(cleaned)
+
+
 # ============================================================================
 # Violation Types for Constraint Loss
 # ============================================================================
@@ -161,70 +191,99 @@ class TowersOfHanoiSolver:
         return initial, goal
 
     def solve(
-        self,
-        num_disks: int,
-        source: int = 0,
-        target: int = 2,
-        initial_state: Optional[List[List[int]]] = None,
-        goal_state: Optional[List[List[int]]] = None,
-    ) -> Optional[List[List[int]]]:
+        self,  # instance of TowersOfHanoiSolver
+        num_disks: int,  # total number of disks expected in each state
+        source: int = 0,  # source peg for standard mode (ignored if explicit initial/goal are passed)
+        target: int = 2,  # target peg for standard mode (ignored if explicit initial/goal are passed)
+        initial_state: Optional[List[List[int]]] = None,  # explicit start state (3 pegs) if provided
+        goal_state: Optional[List[List[int]]] = None,  # explicit goal state (3 pegs) if provided
+    ) -> Optional[List[List[int]]]:  # returns shortest move list [[disk, from, to], ...] or None
         """
         Find an optimal (shortest) path with BFS.
-
-        Args:
-            num_disks: Number of disks.
-            source/target: Source and target pegs for standard tower-to-tower solving.
-            initial_state: Optional arbitrary valid start state.
-            goal_state: Optional arbitrary valid goal state.
-
-        Returns:
-            Optimal move list as [[disk, from_peg, to_peg], ...], or None if unsolvable.
         """
+
         if initial_state is None or goal_state is None:
+            # if either state is missing, build standard tower-to-tower start/goal from source/target
             initial_state, goal_state = self._default_states(num_disks, source, target)
 
         self._validate_state(initial_state, num_disks)
+        # ensure initial state has exactly 3 pegs, proper ordering, and each disk exactly once
+
         self._validate_state(goal_state, num_disks)
+        # same validation for goal state
 
         start = self._state_to_tuple(initial_state)
+        # convert mutable list-of-lists into immutable tuple-of-tuples so it can be hashed
+
         goal = self._state_to_tuple(goal_state)
+        # same conversion for goal
 
         if start == goal:
+            # already solved: zero moves needed
             return []
 
         queue = deque([(start, [])])
+        # BFS frontier: each item is (state, path_to_reach_state)
+        # start with initial state and empty path
+
         visited = {start}
+        # set of states already seen, to avoid cycles/reprocessing
 
         while queue:
+            # standard BFS loop until no states left to explore
             current, path = queue.popleft()
+            # pop oldest element => explores by increasing path length
 
             for from_peg in range(3):
+                # try moving from peg 0, 1, 2
                 if not current[from_peg]:
+                    # if source peg empty, cannot move from it
                     continue
 
                 disk = current[from_peg][-1]
+                # top disk on source peg (only movable disk)
+
                 for to_peg in range(3):
+                    # try destination peg 0, 1, 2
                     if from_peg == to_peg:
+                        # skip no-op move
                         continue
+
                     if current[to_peg] and current[to_peg][-1] < disk:
+                        # if destination has smaller top disk, move is illegal
                         continue
 
                     new_state = [list(peg) for peg in current]
+                    # make mutable copy of current state for simulation
+
                     new_state[from_peg].pop()
+                    # remove top disk from source peg
+
                     new_state[to_peg].append(disk)
+                    # place disk onto destination peg
+
                     new_tuple = self._state_to_tuple(new_state)
+                    # convert back to immutable canonical form
 
                     if new_tuple in visited:
+                        # skip already-seen state
                         continue
 
                     new_path = path + [[disk, from_peg, to_peg]]
+                    # build path for this child state by appending this move
+
                     if new_tuple == goal:
+                        # first time goal is found in BFS => guaranteed shortest path
                         return new_path
 
                     visited.add(new_tuple)
+                    # mark as seen now (prevents duplicate enqueues)
+
                     queue.append((new_tuple, new_path))
+                    # enqueue child for future BFS expansion
 
         return None
+        # if queue exhausts without finding goal, no solution exists
 # ============================================================================
 # Validators
 # ============================================================================
@@ -234,21 +293,17 @@ class TowersOfHanoiValidator:
     """Validates standard TOH responses for canonical start -> peg 2 goal."""
 
     def parse_moves(self, reasoning_trace: str) -> List[List[int]]:
-        moves_pattern = r'moves\s*=\s*(\[(?:\s*\[[^\]]+\]\s*,?\s*)+\])'
         text_outside_think = re.sub(r'<think>.*?</think>', '', reasoning_trace, flags=re.DOTALL)
-        candidates = re.findall(moves_pattern, text_outside_think, re.DOTALL)
+        moves_str = _extract_moves_block(text_outside_think)
 
-        if len(candidates) == 0:
+        if moves_str is None:
             raise ValueError(
                 "No moves found in final answer (outside <think> tags). "
                 "Expected format: moves = [[disk id, from peg, to peg], ...]"
             )
 
-        moves_str = candidates[-1].strip()
-        moves_str = re.sub(r'\]\s*[^\]]*$', ']', moves_str)
-
         try:
-            moves = json.loads(moves_str)
+            moves = _parse_moves_json(moves_str)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse moves array: {e}")
 
@@ -328,19 +383,15 @@ class NonStandardValidator:
     """Validates solutions for arbitrary initial/goal TOH configurations."""
 
     def __init__(self):
-        self.move_pattern = re.compile(
-            r'moves\s*=\s*(\[(?:\s*\[[^\]]+\]\s*,?\s*)+\])',
-            re.DOTALL,
-        )
+        self.solver = TowersOfHanoiSolver()
 
     def parse_moves(self, response: str) -> Optional[List[List[int]]]:
-        matches = self.move_pattern.findall(response)
-        if not matches:
+        moves_str = _extract_moves_block(response)
+        if moves_str is None:
             return None
 
-        moves_str = matches[-1].strip()
         try:
-            moves = json.loads(moves_str)
+            moves = _parse_moves_json(moves_str)
             return moves
         except json.JSONDecodeError:
             return None
@@ -391,12 +442,36 @@ class NonStandardValidator:
 
         solved = state == goal_state
 
+        optimal_path = None
+        optimal_moves = None
+        is_optimal = False
+        try:
+            optimal_path = self.solver.solve(
+                num_disks=num_disks,
+                initial_state=initial_state,
+                goal_state=goal_state,
+            )
+            optimal_moves = len(optimal_path) if optimal_path is not None else None
+            is_optimal = (
+                solved
+                and violations == 0
+                and optimal_moves is not None
+                and len(moves) == optimal_moves
+            )
+        except ValueError:
+            optimal_path = None
+            optimal_moves = None
+            is_optimal = False
+
         return {
             'success': True,
             'violations': violations,
             'num_moves': len(moves),
             'solved': solved,
             'final_state': state,
+            'optimal_moves': optimal_moves,
+            'is_optimal': is_optimal,
+            'extra_moves': (len(moves) - optimal_moves) if (solved and optimal_moves is not None) else None,
         }
 
 

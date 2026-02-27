@@ -6,3 +6,4 @@ flash-attention/
 training_outputs/
 .env
 jobs/
+new_baseline_results/

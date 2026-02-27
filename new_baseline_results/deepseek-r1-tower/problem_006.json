@@ -99,7 +99,7 @@
   "validation": {
     "success": true,
     "violations": 0,
-    "num_moves": null,
+    "num_moves": 7,
     "solved": true,
     "reward": 1.5
   },
