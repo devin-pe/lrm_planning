@@ -76,9 +76,25 @@ def draw_wavy_hanoi_path():
     print(f"Saved {out_base}.png")
 
 
-def draw_sierpinski_top_down(user_labels, optimal_states=None, suboptimal_states=None):
-    if len(user_labels) != 81:
-        raise ValueError(f"You must provide exactly 81 labels. You provided {len(user_labels)}.")
+def draw_sierpinski_top_down(optimal_states=None, suboptimal_states=None):
+    user_labels = [
+    "1111",
+    "3111", "2111",
+    "3211", "2311",
+    "2211", "1211", "1311", "3311",
+    "2231", "3321",
+    "1231", "3231", "2321", "1321",
+    "1331", "3131", "2121", "1221",
+    "3331", "2331", "2131", "1131", "1121", "3121", "3221", "2221",
+    "3332", "2223",
+    "2332", "1332", "1223", "3223",
+    "2132", "1232", "1323", "3123",
+    "1132", "3132", "3232", "2232", "3323", "2323", "2123", "1123",
+    "1122", "2212", "3313", "1133",
+    "3122", "2122", "1212", "3212", "2313", "1313", "3133", "2133",
+    "3222", "2322", "1312", "3112", "2113", "1213", "3233", "2333",
+    "2222", "1222", "1322", "3322", "3312", "2312", "2112", "1112", "1113", "3113", "3213", "2213", "2233", "1233", "1333", "3333"
+    ]
 
     # 1. Geometry Setup
     h = np.sqrt(3) / 2
@@ -137,51 +153,139 @@ def draw_sierpinski_top_down(user_labels, optimal_states=None, suboptimal_states
             x2, y2 = label_to_coord[v]
             ax.plot([x1, x2], [y1, y2], color=color, linewidth=2.5, alpha=0.95, zorder=2)
 
-    draw_path_edges(optimal_states, 'green')
     draw_path_edges(suboptimal_states, 'red')
+    draw_path_edges(optimal_states, 'green')
+
+    highlight_path = optimal_states if optimal_states else suboptimal_states
+    if highlight_path:
+        start_state = highlight_path[0]
+        end_state = highlight_path[-1]
+
+        if start_state in label_to_coord:
+            x, y = label_to_coord[start_state]
+            ax.scatter(x, y, color='orange', s=140, zorder=5)
+
+        if end_state in label_to_coord:
+            x, y = label_to_coord[end_state]
+            ax.scatter(x, y, color='blue', s=140, zorder=5)
 
     ax.set_aspect('equal')
     ax.axis('off')
     output_dir = 'graphs'
     os.makedirs(output_dir, exist_ok=True)
-    out_base = os.path.join(output_dir, 'optimal_sierpinski')
+    out_base = os.path.join(output_dir, 'sierpinski_4disk')
     plt.savefig(f'{out_base}.png', dpi=220, bbox_inches='tight', facecolor='white', edgecolor='none')
     print(f"Saved {out_base}.png")
 
 
-state_labels = [
-"1111",
-"3111", "2111",
-"3211", "2311",
-"2211", "1211", "1311", "3311",
-"2231", "3321",
-"1231", "3231", "2321", "1321",
-"1331", "3131", "2121", "1221",
-"3331", "2331", "2131", "1131", "1121", "3121", "3221", "2221",
-"3332", "2223",
-"2332", "1332", "1223", "3223",
-"2132", "1232", "1323", "3123",
-"1132", "3132", "3232", "2232", "3323", "2323", "2123", "1123",
-"1122", "2212", "3313", "1133",
-"3122", "2122", "1212", "3212", "2313", "1313", "3133", "2133",
-"3222", "2322", "1312", "3112", "2113", "1213", "3233", "2333",
-"2222", "1222", "1322", "3322", "3312", "2312", "2112", "1112", "1113", "3113", "3213", "2213", "2233", "1233", "1333", "3333"
-]
+def draw_sierpinski_top_down_3disk(optimal_states=None, suboptimal_states=None):
+    user_labels = [
+        "111",
+        "211", "311",
+        "231", "321",
+        "331", "131", "121", "221",
+        "332", "223",
+        "132", "232", "323", "123",
+        "122", "212", "313", "133",
+        "222", "322", "312", "112", "113", "213", "233", "333"
+    ]
+    # 1. Geometry Setup
+    h = np.sqrt(3) / 2
+    corners = {
+        '1': np.array([0.5, h]),  # Top
+        '2': np.array([0, 0]),    # Bottom Left
+        '3': np.array([1, 0])     # Bottom Right
+    }
 
-kimi_failed_states = [
-    '1111', '3111', '3211', '2211', '2231', '1231', '1331', '3331',
-    '3332', '2332', '2132', '1132', '1122', '3122', '3222', '2222',
-]
+    # 2. Generate all 27 coordinates
+    all_coords = []
+    state_addresses = list(itertools.product(['1', '2', '3'], repeat=3))
 
-optimal_states = [
-    '1111', '2111', '2311', '3311', '3321', '1321', '1221', '2221',
-    '2223', '3223', '3123', '1123', '1133', '2133', '2333', '3333',
-]
+    for state in state_addresses:
+        pos = np.array([0.0, 0.0])
+        for i, peg in enumerate(state):
+            weight = 0.5 ** (i + 1)
+            pos += weight * corners[peg]
+        all_coords.append(pos)
 
-draw_sierpinski_top_down(
-    state_labels,
-    optimal_states=optimal_states,
-    suboptimal_states=kimi_failed_states,
-)
+    # 3. SORTING LOGIC: Top-to-Bottom, then Left-to-Right
+    sorted_coords = sorted(all_coords, key=lambda p: (-p[1], p[0]))
+
+    # 4. Visualization
+    plt.figure(figsize=(12, 12))
+    ax = plt.gca()
+
+    label_offset = 0.015
+
+    label_to_coord = {}
+    for i, (x, y) in enumerate(sorted_coords):
+        label = user_labels[i]
+        label_to_coord[label] = (x, y)
+
+        ax.scatter(x, y, color='black', s=20, zorder=3)
+        ax.text(
+            x,
+            y + label_offset,
+            str(label),
+            fontsize=8,
+            ha='center',
+            va='bottom',
+            color='black',
+            fontweight='bold',
+            zorder=4,
+        )
+
+    def draw_path_edges(path_states, color):
+        if not path_states:
+            return
+        for u, v in zip(path_states, path_states[1:]):
+            if u not in label_to_coord or v not in label_to_coord:
+                continue
+            x1, y1 = label_to_coord[u]
+            x2, y2 = label_to_coord[v]
+            ax.plot([x1, x2], [y1, y2], color=color, linewidth=2.5, alpha=0.95, zorder=2)
+
+    # Same input format as 4-disk version:
+    # optimal_states / suboptimal_states should be lists like ['111', '211', '231', ...]
+    draw_path_edges(suboptimal_states, 'red')
+    draw_path_edges(optimal_states, 'green')
+
+    highlight_path = optimal_states if optimal_states else suboptimal_states
+    if highlight_path:
+        start_state = highlight_path[0]
+        end_state = highlight_path[-1]
+
+        if start_state in label_to_coord:
+            x, y = label_to_coord[start_state]
+            ax.scatter(x, y, color='orange', s=160, zorder=5)
+
+        if end_state in label_to_coord:
+            x, y = label_to_coord[end_state]
+            ax.scatter(x, y, color='blue', s=160, zorder=5)
+
+    ax.set_aspect('equal')
+    ax.axis('off')
+    output_dir = 'graphs'
+    os.makedirs(output_dir, exist_ok=True)
+    out_base = os.path.join(output_dir, 'sierpinski_3disk')
+    plt.savefig(f'{out_base}.png', dpi=220, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"Saved {out_base}.png")
+
+
+
+# optimal_states_oss = ['332', '331', '131', '121', '221', '223', '323']
+# suboptimal_states_oss = ['332', '232', '212', '312', '112', '113', '313', '323']
+
+# optimal_states_deepseek = ['3313', '2313', '2113', '1113', '1112', '2112', '2312', '3312', '3322', '2322', '2122', '1122']
+# suboptimal_states_deepseek = ['3313', '2313', '2113', '1113', '1112', '3112', '3212', '2212', '2232', '3232', '3132', '1132', '1122']
+
+# optimal_states_kimi = ['3313', '1313', '1213', '2213', '2233', '1233', '1333']
+# suboptimal_states_kimi = ['3313', '2313', '2113', '3113', '3213', '2213', '2233', '1233', '1333']
+
+if __name__ == '__main__':
+    draw_sierpinski_top_down(
+        optimal_states=optimal_states_kimi,
+        suboptimal_states=suboptimal_states_kimi,
+    )
 
 

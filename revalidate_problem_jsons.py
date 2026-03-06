@@ -30,12 +30,17 @@ def _validate_standard(record: Dict, validator: TowersOfHanoiValidator) -> Tuple
     )
 
     solved = reward >= 1.0
+    optimal_moves = 2 ** int(num_disks) - 1
+    is_optimal = solved and violations == 0 and parse_ok and num_moves == optimal_moves
     validation = {
         "success": parse_ok,
         "violations": violations,
         "num_moves": num_moves,
         "solved": solved,
         "reward": reward,
+        "optimal_moves": optimal_moves,
+        "is_optimal": is_optimal,
+        "extra_moves": (num_moves - optimal_moves) if (solved and parse_ok) else None,
     }
     return validation, solved
 
@@ -48,6 +53,8 @@ def _validate_nonstandard(record: Dict, validator: NonStandardValidator) -> Tupl
     num_disks = record.get("num_disks", info.get("num_disks"))
 
     validation = validator.validate(response_text, initial_state, goal_state, num_disks)
+    if "is_optimal" not in validation:
+        validation["is_optimal"] = False
     return validation, bool(validation.get("solved", False))
 
 
@@ -74,6 +81,7 @@ def revalidate_directory(dir_path: Path) -> Dict:
 
         old_validation = record.get("validation")
         record["validation"] = validation
+        record["is_optimal"] = bool(validation.get("is_optimal", False))
 
         if old_validation != validation:
             updated += 1

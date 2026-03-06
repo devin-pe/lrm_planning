@@ -800,8 +800,6 @@ class NonStandardTOHDataset(Dataset):
                     'system_prompt': system_prompt,
                     'user_prompt': user_prompt,
                     'problem_info': problem_info,
-                    'initial_state': problem_info['initial_state'],
-                    'goal_state': problem_info['goal_state'],
                     'config_type': 'nonstandard',
                     'optimal_moves': optimal_moves if optimal_moves is not None else [],
                 })
@@ -874,8 +872,6 @@ class BaselineProblemGenerator:
                     "system_prompt": problem["system_prompt"],
                     "user_prompt": problem["user_prompt"],
                     "problem_info": problem_info,
-                    "initial_state": initial_state,
-                    "goal_state": goal_state,
                     "config_type": "standard",
                     "goal_peg": goal_peg,
                     "optimal_moves": problem["optimal_moves"] if problem["optimal_moves"] is not None else [],

@@ -7,3 +7,6 @@ training_outputs/
 .env
 jobs/
 new_baseline_results/
+agent_results/
+experiments/
+graphs/

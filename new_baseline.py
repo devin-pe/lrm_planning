@@ -201,8 +201,8 @@ def main():
         if problem_mode == "standard":
             print(f"\n[Problem {pid + 1}/{total_problems}] "
                   f"disks={p['num_disks']} "
-                  f"initial={p['initial_state']} "
-                  f"goal={p['goal_state']}")
+                  f"initial={p['problem_info']['initial_state']} "
+                  f"goal={p['problem_info']['goal_state']}")
         else:
             print(f"\n[Problem {pid + 1}/{total_problems}] "
                   f"disks={p['num_disks']} "
@@ -220,12 +220,26 @@ def main():
                 response_text,
                 {"num_disks": p["num_disks"], "goal_peg": p.get("goal_peg", 2)},
             )
+            num_moves = None
+            parse_ok = True
+            try:
+                parsed_moves = validator.parse_moves(response_text)
+                num_moves = len(parsed_moves)
+            except ValueError:
+                parse_ok = False
+
+            solved = reward >= 1.0
+            optimal_moves = 2 ** p["num_disks"] - 1
+            is_optimal = solved and violations == 0 and parse_ok and num_moves == optimal_moves
             validation = {
-                "success": True,
+                "success": parse_ok,
                 "violations": violations,
-                "num_moves": None,
-                "solved": reward >= 1.0,
+                "num_moves": num_moves,
+                "solved": solved,
                 "reward": reward,
+                "optimal_moves": optimal_moves,
+                "is_optimal": is_optimal,
+                "extra_moves": (num_moves - optimal_moves) if (solved and parse_ok and num_moves is not None) else None,
             }
         else:
             validation = validator.validate(
@@ -234,11 +248,14 @@ def main():
                 p["problem_info"]["goal_state"],
                 p["num_disks"],
             )
+            if "is_optimal" not in validation:
+                validation["is_optimal"] = False
 
         result = {
             **p,
             "response": response,
             "validation": validation,
+            "is_optimal": bool(validation.get("is_optimal", False)),
             "elapsed_seconds": round(elapsed, 2),
         }
         results.append(result)

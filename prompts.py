@@ -19,7 +19,8 @@ Capabilities:
 - write_file: Create files in the sandbox
 - read_file: Read files from the sandbox
 
-Please solve the following planning problem by creating a script that outputs the optimal sequence of steps. Terminate when your script returns the correct answer, error-free.
+Please solve the following planning problem by creating a script that outputs the optimal sequence of steps. Terminate when your script returns the correct answer, error-free. 
+You should create and run code at least once.
 
 Best practices:
 - Break complex tasks into smaller steps

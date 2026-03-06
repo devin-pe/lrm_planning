@@ -29,7 +29,7 @@ _root = Path(__file__).resolve().parents[1]
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -43,7 +43,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import prompts and problem generation from the shared module
-from prompts import CODE_SYSTEM_PROMPT, SYSTEM_PROMPT, create_nonstandard_prompt
+from prompts import CODE_SYSTEM_PROMPT, SYSTEM_PROMPT
+from planning import BaselineProblemGenerator
+from planning import NonStandardValidator, TowersOfHanoiValidator
 
 # Import tools from the existing agent module
 _agent_dir = str(Path(__file__).resolve().parent)
@@ -60,6 +62,8 @@ NUM_PROBLEMS = 10
 DISK_RANGE = [3, 4, 5]
 SEED = 42
 MAX_ITERATIONS = 10  # safety cap on agent loops per problem
+PROBLEM_MODE = "nonstandard"  # "standard" or "nonstandard"
+MODEL_NAME = "deepseek/deepseek-r1"
 
 OUTPUT_DIR = os.path.join(str(_root), "agent_results")
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -85,7 +89,7 @@ model = ChatOpenAI(
     openai_api_key=os.getenv("OPENROUTER_API_KEY"),
     openai_api_base="https://openrouter.ai/api/v1",
     temperature=0.0,
-    model="deepseek/deepseek-r1",
+    model=MODEL_NAME,
     timeout=1200,
     stream_usage=True,
 ).bind_tools(tools, parallel_tool_calls=False)
@@ -117,35 +121,44 @@ graph_builder.add_edge("tools", "agent")
 graph = graph_builder.compile()
 
 
+def _configure_agent_model(model_name: str) -> None:
+    global model, graph
+
+    model = ChatOpenAI(
+        openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+        openai_api_base="https://openrouter.ai/api/v1",
+        temperature=0.0,
+        model=model_name,
+        timeout=1200,
+        stream_usage=True,
+    ).bind_tools(tools, parallel_tool_calls=False)
+
+    graph_builder = StateGraph(State)
+    graph_builder.add_node("agent", agent_node)
+    graph_builder.add_node("tools", tool_node)
+    graph_builder.add_edge(START, "agent")
+    graph_builder.add_conditional_edges("agent", tool_router, ["tools", END])
+    graph_builder.add_edge("tools", "agent")
+    graph = graph_builder.compile()
+
+
 # ============================================================================
 # Problem Generation (mirrors new_baseline.py)
 # ============================================================================
 
-def generate_problems(disk_range: list, num_problems: int, seed: int) -> list:
-    """Generate TOH problems stratified across disk counts."""
-    counts_per_disk = {d: num_problems // len(disk_range) for d in disk_range}
-    remainder = num_problems - sum(counts_per_disk.values())
-    for d in disk_range[:remainder]:
-        counts_per_disk[d] += 1
+def generate_problems(disk_range: list, num_problems: int, seed: int, mode: str) -> list:
+    """Generate TOH problems via shared baseline generator."""
+    mode = mode.strip().lower()
+    if mode not in {"standard", "nonstandard"}:
+        raise ValueError(f"Invalid problem mode '{mode}'. Expected 'standard' or 'nonstandard'.")
 
-    problems = []
-    global_id = 0
-    for num_disks in disk_range:
-        for i in range(counts_per_disk[num_disks]):
-            system_prompt, user_prompt, problem_info = create_nonstandard_prompt(
-                num_disks=num_disks,
-                problem_id=i,
-                seed=seed,
-            )
-            problems.append({
-                "problem_id": global_id,
-                "num_disks": num_disks,
-                "system_prompt": system_prompt,
-                "user_prompt": user_prompt,
-                "problem_info": problem_info,
-            })
-            global_id += 1
-    return problems
+    return BaselineProblemGenerator.generate_problems(
+        num_problems=num_problems,
+        min_disks=min(disk_range),
+        max_disks=max(disk_range),
+        seed=seed,
+        mode=mode,
+    )
 
 
 # ============================================================================
@@ -280,6 +293,79 @@ def run_problem(problem: dict, run_dir: str = None) -> dict:
     }
 
 
+def validate_agent_solution(
+    problem: Dict,
+    final_answer: str,
+    message_history: List[Dict],
+    standard_validator: TowersOfHanoiValidator,
+    nonstandard_validator: NonStandardValidator,
+) -> Dict:
+    response_text_for_validation = final_answer
+    if message_history:
+        history_text = "\n\n".join(
+            str(msg.get("content", ""))
+            for msg in message_history
+            if msg.get("role") in {"ai", "tool"}
+        )
+        if history_text.strip():
+            response_text_for_validation = f"{final_answer}\n\n{history_text}"
+
+    config_type = (
+        problem.get("config_type")
+        or problem.get("problem_info", {}).get("config_type")
+        or "nonstandard"
+    ).strip().lower()
+
+    num_disks = int(problem.get("num_disks", problem.get("problem_info", {}).get("num_disks", 3)))
+
+    if config_type == "standard":
+        goal_peg = problem.get("goal_peg", problem.get("problem_info", {}).get("goal_peg", 2))
+
+        try:
+            moves = standard_validator.parse_moves(response_text_for_validation)
+            num_moves = len(moves)
+            parse_ok = True
+        except ValueError:
+            num_moves = 0
+            parse_ok = False
+
+        reward, violations = standard_validator.validate_trace(
+            response_text_for_validation,
+            {"num_disks": num_disks, "goal_peg": goal_peg},
+        )
+
+        solved = reward >= 1.0
+        optimal_moves = 2 ** num_disks - 1
+        is_optimal = solved and violations == 0 and parse_ok and num_moves == optimal_moves
+
+        return {
+            "success": parse_ok,
+            "config_type": "standard",
+            "violations": violations,
+            "num_moves": num_moves,
+            "solved": solved,
+            "reward": reward,
+            "optimal_moves": optimal_moves,
+            "is_optimal": is_optimal,
+            "extra_moves": (num_moves - optimal_moves) if solved and parse_ok else None,
+        }
+
+    info = problem.get("problem_info", {})
+    initial_state = problem.get("initial_state", info.get("initial_state"))
+    goal_state = problem.get("goal_state", info.get("goal_state"))
+
+    validation = nonstandard_validator.validate(
+        response_text_for_validation,
+        initial_state,
+        goal_state,
+        num_disks,
+    )
+    if "is_optimal" not in validation:
+        validation["is_optimal"] = False
+    validation["config_type"] = "nonstandard"
+    return validation
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -319,11 +405,27 @@ def main():
         default=None,
         help="Only run the first N problems (default: run all)",
     )
+    parser.add_argument(
+        "--problem-mode",
+        type=str,
+        default=os.getenv("PROBLEM_MODE", PROBLEM_MODE),
+        choices=["standard", "nonstandard"],
+        help="Problem mode to generate when --problems is not provided.",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default=os.getenv("MODEL_NAME", MODEL_NAME),
+        help="OpenRouter model name to use for the agent.",
+    )
     args = parser.parse_args()
 
     if not os.getenv("OPENROUTER_API_KEY"):
         print("ERROR: Set OPENROUTER_API_KEY environment variable.")
         sys.exit(1)
+
+    _configure_agent_model(args.model_name)
+    print(f"Using model: {args.model_name}")
 
     # Load or generate problems
     if args.problems:
@@ -331,8 +433,11 @@ def main():
         with open(args.problems) as f:
             problems = json.load(f)
     else:
-        print(f"Generating {args.num_problems} problems for disks {args.disks}")
-        problems = generate_problems(args.disks, args.num_problems, args.seed)
+        print(
+            f"Generating {args.num_problems} {args.problem_mode} problems "
+            f"for disks {args.disks}"
+        )
+        problems = generate_problems(args.disks, args.num_problems, args.seed, args.problem_mode)
 
     # Optionally limit the number of problems
     if args.max_problems is not None:
@@ -341,6 +446,9 @@ def main():
     # Create output directory
     run_dir = os.path.join(OUTPUT_DIR, f"run_{TIMESTAMP}")
     os.makedirs(run_dir, exist_ok=True)
+
+    standard_validator = TowersOfHanoiValidator()
+    nonstandard_validator = NonStandardValidator()
 
     # Save problems manifest
     manifest_path = os.path.join(run_dir, "problems.json")
@@ -363,6 +471,15 @@ def main():
         _print_flush(f"{'#' * 60}")
 
         result = run_problem(p, run_dir=run_dir)
+        validation = validate_agent_solution(
+            problem=p,
+            final_answer=result["agent_response"].get("final_answer", ""),
+            message_history=result["agent_response"].get("messages", []),
+            standard_validator=standard_validator,
+            nonstandard_validator=nonstandard_validator,
+        )
+        result["validation"] = validation
+        result["is_optimal"] = bool(validation.get("is_optimal", False))
         results.append(result)
 
         # Save individual result
@@ -372,15 +489,46 @@ def main():
 
         _print_flush(
             f"\n  ✓ Problem {pid + 1} done in {result['elapsed_seconds']:.1f}s  |  "
-            f"Messages: {result['agent_response']['num_messages']}"
+            f"Messages: {result['agent_response']['num_messages']}  |  "
+            f"Solved: {validation.get('solved', False)}  |  "
+            f"Optimal: {validation.get('is_optimal', False)}"
         )
 
     # Save combined results
     combined_path = os.path.join(run_dir, "all_results.json")
     with open(combined_path, "w") as f:
         json.dump(results, f, indent=2)
+
+    solved_count = sum(1 for r in results if r.get("validation", {}).get("solved", False))
+    optimal_count = sum(1 for r in results if r.get("validation", {}).get("is_optimal", False))
+
+    per_disk_total = {}
+    per_disk_solved = {}
+    per_disk_optimal = {}
+    for r in results:
+        disk = r.get("num_disks")
+        if disk is None:
+            continue
+        per_disk_total[disk] = per_disk_total.get(disk, 0) + 1
+        if r.get("validation", {}).get("solved", False):
+            per_disk_solved[disk] = per_disk_solved.get(disk, 0) + 1
+        if r.get("validation", {}).get("is_optimal", False):
+            per_disk_optimal[disk] = per_disk_optimal.get(disk, 0) + 1
+
     _print_flush(f"\n{'=' * 60}")
     _print_flush(f"All {total} results saved to {combined_path}")
+    _print_flush(f"Solved: {solved_count}/{total} ({100 * solved_count / total:.1f}%)")
+    _print_flush(f"Optimal: {optimal_count}/{total} ({100 * optimal_count / total:.1f}%)")
+    if per_disk_total:
+        _print_flush("Solved/Optimal by disk:")
+        for disk in sorted(per_disk_total):
+            solved = per_disk_solved.get(disk, 0)
+            optimal = per_disk_optimal.get(disk, 0)
+            total_disk = per_disk_total[disk]
+            _print_flush(
+                f"  {disk} disks: solved {solved}/{total_disk} ({100 * solved / total_disk:.1f}%), "
+                f"optimal {optimal}/{total_disk} ({100 * optimal / total_disk:.1f}%)"
+            )
     _print_flush(f"{'=' * 60}")
 
 
