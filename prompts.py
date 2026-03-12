@@ -19,8 +19,28 @@ Capabilities:
 - write_file: Create files in the sandbox
 - read_file: Read files from the sandbox
 
-Please solve the following planning problem by creating a script that outputs the optimal sequence of steps. Terminate when your script returns the correct answer, error-free. 
-You should create and run code at least once.
+Please solve the following planning problem by creating a script that outputs the optimal sequence of steps.
+There are three pegs and n disks of different sizes stacked on the first peg.
+
+The disks are numbered from 1 (smallest) to n (largest). Disk moves in this puzzle should follow:
+1. Only one disk can be moved at a time.
+2. Each move consists of taking the upper disk from one stack and placing it on top of another stack.
+3. A larger disk may not be placed on top of a smaller disk.
+The goal is to move the entire stack to the third peg.
+
+Example: With 3 disks numbered 1 (smallest), 2, and 3 (largest), the initial state is [[3, 2, 1], [], []], and a solution might be:
+
+moves = [[1 , 0, 2], [2, 0, 1], [1, 2, 1], [3, 0, 2], [1, 1, 0], [2, 1, 2], [1, 0, 2]]
+
+This means: Move disk 1 from peg 0 to peg 2, then move disk 2 from peg 0 to peg 1, and so on.
+
+Requirements:
+- When exploring potential solutions in your thinking process, always include the corresponding
+complete list of moves.
+- The positions are 0-indexed (the leftmost peg is 0).
+- Ensure your final answer includes the complete list of moves in the format: moves = [[disk id, from peg, to peg], ...]
+
+Terminate when your script returns the correct answer, error-free. You should create and run code at least once.
 
 Best practices:
 - Break complex tasks into smaller steps
@@ -48,10 +68,10 @@ moves = [[1 , 0, 2], [2, 0, 1], [1, 2, 1], [3, 0, 2], [1, 1, 0], [2, 1, 2], [1, 
 This means: Move disk 1 from peg 0 to peg 2, then move disk 2 from peg 0 to peg 1, and so on.
 
 Requirements:
-• When exploring potential solutions in your thinking process, always include the corresponding
+- When exploring potential solutions in your thinking process, always include the corresponding
 complete list of moves.
-• The positions are 0-indexed (the leftmost peg is 0).
-• Ensure your final answer includes the complete list of moves in the format: moves = [[disk id, from peg, to peg], ...]"""
+- The positions are 0-indexed (the leftmost peg is 0).
+- Ensure your final answer includes the complete list of moves in the format: moves = [[disk id, from peg, to peg], ...]"""
 
 
 # ============================================================================
@@ -106,19 +126,19 @@ def create_standard_prompt(num_disks: int, goal_peg: int = 2) -> Tuple[str, str]
     
     user_prompt = f"""I have a puzzle with {num_disks} disks of different sizes with
 Initial configuration:
-• Peg 0: {state}
-• Peg 1: (empty)
-• Peg 2: (empty)
+- Peg 0: {state}
+- Peg 1: (empty)
+- Peg 2: (empty)
 
 Goal configuration:
-• Peg 0: (empty)
-• Peg 1: (empty)
-• Peg 2: {state}
+- Peg 0: (empty)
+- Peg 1: (empty)
+- Peg 2: {state}
 
 Rules:
-• Only one disk can be moved at a time.
-• Only the top disk from any stack can be moved.
-• A larger disk may not be placed on top of a smaller disk.
+- Only one disk can be moved at a time.
+- Only the top disk from any stack can be moved.
+- A larger disk may not be placed on top of a smaller disk.
 
 Find the sequence of moves to transform the initial configuration into the goal configuration."""
     
@@ -147,19 +167,19 @@ def create_standard_prompt_with_info(num_disks: int) -> Tuple[str, str, Dict]:
     
     user_prompt = f"""I have a puzzle with {num_disks} disks of different sizes with
 Initial configuration:
-• Peg 0: {initial_peg0}
-• Peg 1: {initial_peg1}
-• Peg 2: {initial_peg2}
+- Peg 0: {initial_peg0}
+- Peg 1: {initial_peg1}
+- Peg 2: {initial_peg2}
 
 Goal configuration:
-• Peg 0: {goal_peg0}
-• Peg 1: {goal_peg1}
-• Peg 2: {goal_peg2}
+- Peg 0: {goal_peg0}
+- Peg 1: {goal_peg1}
+- Peg 2: {goal_peg2}
 
 Rules:
-• Only one disk can be moved at a time.
-• Only the top disk from any stack can be moved.
-• A larger disk may not be placed on top of a smaller disk.
+- Only one disk can be moved at a time.
+- Only the top disk from any stack can be moved.
+- A larger disk may not be placed on top of a smaller disk.
 
 Find the sequence of moves to transform the initial configuration into the goal configuration."""
     

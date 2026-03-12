@@ -1,13 +1,14 @@
 #!/bin/bash
 
-#SBATCH --partition=gpu_a100          # Partition name
-#SBATCH --gres=gpu:2                  # Number of GPUs: training on GPU 0, vLLM on GPU 1
-#SBATCH --mem=150G
-#SBATCH --cpus-per-task=12            # Number of CPU cores per task
-#SBATCH --job-name=train              # Job name (customize)
-#SBATCH --ntasks=1                    # Number of tasks
-#SBATCH --time=8:00:00                # Time limit (increased for training)
-#SBATCH --output=/home/dpereira/lrm_planning/work/train_%A.out  # Standard output (%A expands to job ID)
+#SBATCH --partition=gpu_a100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --job-name=train_toh_transformer
+#SBATCH --ntasks=1
+#SBATCH --time=12:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/train_toh_transformer_%A.out
+
+set -euo pipefail
 
 module purge
 module load 2025
@@ -16,43 +17,39 @@ module load CUDA/12.8.0
 source /home/dpereira/lrm_planning/env/bin/activate
 
 REPO_ROOT=/home/dpereira/lrm_planning
-cd $REPO_ROOT
+cd "$REPO_ROOT"
 
-# Set all cache directories to scratch to avoid disk quota issues
-export SCRATCH_DIR=/scratch-shared/dpereira
-mkdir -p $SCRATCH_DIR
+# # Keep caches on scratch to avoid home quota pressure.
+# export SCRATCH_DIR=/scratch-shared/dpereira
+# mkdir -p "$SCRATCH_DIR"
 
-# HuggingFace cache
-export HF_HOME=$SCRATCH_DIR/hf_cache
-export TRANSFORMERS_CACHE=$SCRATCH_DIR/transformers
-export HF_DATASETS_CACHE=$SCRATCH_DIR/datasets
-mkdir -p $HF_HOME $TRANSFORMERS_CACHE $HF_DATASETS_CACHE
+# export TORCH_HOME=$SCRATCH_DIR/torch_cache
+# export TRITON_CACHE_DIR=$SCRATCH_DIR/triton_cache
+# export XDG_CACHE_HOME=$SCRATCH_DIR/cache
+# mkdir -p "$TORCH_HOME" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME"
 
-# PyTorch/Triton compilation caches
-export TORCH_HOME=$SCRATCH_DIR/torch_cache
-export TRITON_CACHE_DIR=$SCRATCH_DIR/triton_cache
-mkdir -p $TORCH_HOME $TRITON_CACHE_DIR
+echo "========== ToH Transformer Training =========="
+echo "Repo: $REPO_ROOT"
+echo "Python: $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "============================================="
 
-# General XDG cache
-export XDG_CACHE_HOME=$SCRATCH_DIR/cache
-mkdir -p $XDG_CACHE_HOME
+# # Stage 1: n=3 (target >=99% sequence accuracy)
+# python toh_transformer/train.py \
+#   --n_disks 3 \
+#   --num_epochs 200 \
+#   --batch_size 64 \
+#   --checkpoint_dir toh_transformer/checkpoints
 
-# Check if vLLM is installed, install if not
-python -c "import vllm" 2>/dev/null || pip install vllm
+# Stage 2: n=4 (target >=95% sequence accuracy)
+python toh_transformer/train.py \
+  --n_disks 4 \
+  --num_epochs 50 \
+  --batch_size 64 \
+  --checkpoint_dir toh_transformer/checkpoints
 
-# Run training with vLLM for 10-20x faster generation
-# 7B model: training on GPU 0, vLLM on GPU 1
-python train.py \
-  --model_name deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
-  --num_train_problems 10 \
-  --num_eval_problems 3 \
-  --num_epochs 3 \
-  --num_samples 4 \
-  --save_steps 50 \
-  --logging_steps 5 \
-  --cache_dir /scratch-shared/dpereira \
-  --max_new_tokens 4096 \
-  --use_vllm
+echo "Training runs completed."
 
 
 
