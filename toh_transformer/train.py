@@ -21,7 +21,13 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from toh_transformer.config import TrainConfig, parse_train_args
-from toh_transformer.data import DatasetBundle, ToHFlatDataset, build_datasets
+from toh_transformer.data import (
+    DatasetBundle,
+    ToHFlatDataset,
+    build_datasets,
+    build_multi_n_datasets,
+    build_tower_to_tower_multi_n_datasets,
+)
 from toh_transformer.model import ToHTransformer
 
 
@@ -108,13 +114,18 @@ def sequence_accuracy(
     eos_id: int,
     max_seq_len: int,
     device: torch.device,
+    max_examples: int = -1,
 ) -> float:
     if len(dataset) == 0:
         return 0.0
 
     model.eval()
     correct = 0
-    for ex in dataset.encoded:
+    encoded = dataset.encoded
+    if max_examples > 0:
+        encoded = encoded[:max_examples]
+
+    for ex in encoded:
         pred = greedy_decode_moves(
             model=model,
             prefix_ids=ex.prefix_ids,
@@ -125,7 +136,13 @@ def sequence_accuracy(
         if pred == ex.move_target_ids:
             correct += 1
 
-    return correct / len(dataset)
+    return correct / len(encoded)
+
+
+def format_metric(value: float) -> str:
+    if not math.isfinite(value):
+        return "n/a"
+    return f"{value:.4f}"
 
 
 def run_epoch(
@@ -143,13 +160,17 @@ def run_epoch(
     total_correct = 0.0
     total_tokens = 0
 
-    for input_ids, target_ids, loss_mask in loader:
+    for batch_idx, (input_ids, target_ids, loss_mask) in enumerate(loader):
         input_ids = input_ids.to(device)
         target_ids = target_ids.to(device)
         loss_mask = loss_mask.to(device)
 
         logits = model(input_ids)
         loss, batch_token_acc, batch_tokens = masked_ce_and_accuracy(logits, target_ids, loss_mask)
+
+        if not torch.isfinite(loss):
+            phase = "train" if is_train else "eval"
+            raise RuntimeError(f"Non-finite loss detected during {phase} at batch {batch_idx}")
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -198,14 +219,66 @@ def main() -> None:
     use_cuda = cfg.device.startswith("cuda") and torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
 
-    print(f"[INFO] Building dataset for n_disks={cfg.n_disks}...")
-    data: DatasetBundle = build_datasets(n_disks=cfg.n_disks, seed=cfg.seed)
+    if (
+        cfg.data_mode == "flat-to-flat"
+        and len(cfg.train_n_disks) == 1
+        and len(cfg.test_n_disks) == 0
+        and cfg.train_n_disks[0] == cfg.n_disks
+    ):
+        print(f"[INFO] Building dataset for n_disks={cfg.n_disks}...")
+        data: DatasetBundle = build_datasets(n_disks=cfg.n_disks, seed=cfg.seed)
+    else:
+        if cfg.data_mode == "flat-to-flat":
+            print(
+                "[INFO] Building mixed-n flat-to-flat dataset "
+                f"train_n_disks={cfg.train_n_disks}, test_n_disks={cfg.test_n_disks}, val_ratio={cfg.val_ratio:.3f}"
+            )
+            data = build_multi_n_datasets(
+                train_n_disks=cfg.train_n_disks,
+                test_n_disks=cfg.test_n_disks,
+                max_seq_len=cfg.max_seq_len,
+                seed=cfg.seed,
+                val_ratio=cfg.val_ratio,
+            )
+        else:
+            print(
+                "[INFO] Building mixed-n tower-to-tower dataset "
+                f"train_n_disks={cfg.train_n_disks}, test_n_disks={cfg.test_n_disks}, "
+                f"val_ratio={cfg.val_ratio:.3f}, strategy={cfg.tower_data_strategy}, "
+                f"train_repeats={cfg.tower_train_repeats}, test_repeats={cfg.tower_test_repeats}"
+            )
+            data = build_tower_to_tower_multi_n_datasets(
+                train_n_disks=cfg.train_n_disks,
+                test_n_disks=cfg.test_n_disks,
+                max_seq_len=cfg.max_seq_len,
+                seed=cfg.seed,
+                val_ratio=cfg.val_ratio,
+                train_repeats=cfg.tower_train_repeats,
+                test_repeats=cfg.tower_test_repeats,
+                data_strategy=cfg.tower_data_strategy,
+            )
     train_ds = data.train_dataset
     val_ds = data.val_dataset
+    test_ds = data.test_dataset
 
     print(f"[INFO] Train examples: {len(train_ds)}")
     if val_ds is not None:
         print(f"[INFO] Val examples: {len(val_ds)}")
+    if test_ds is not None:
+        print(f"[INFO] Test examples: {len(test_ds)}")
+    seq_eval_scope = "full split" if cfg.seq_eval_max_examples <= 0 else str(cfg.seq_eval_max_examples)
+    train_seq_eval_scope = (
+        seq_eval_scope
+        if cfg.seq_eval_max_train_examples <= 0
+        else str(cfg.seq_eval_max_train_examples)
+    )
+    print(
+        "[INFO] Sequence eval: "
+        f"max_examples_per_split={seq_eval_scope}, "
+        f"max_train_examples={train_seq_eval_scope}, "
+        f"include_train={cfg.seq_eval_include_train}"
+    )
+    print("[INFO] Test split evaluation policy: final epoch only")
 
     train_loader = DataLoader(
         train_ds,
@@ -219,6 +292,16 @@ def main() -> None:
     if val_ds is not None:
         val_loader = DataLoader(
             val_ds,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=use_cuda,
+        )
+
+    test_loader = None
+    if test_ds is not None:
+        test_loader = DataLoader(
+            test_ds,
             batch_size=cfg.batch_size,
             shuffle=False,
             num_workers=cfg.num_workers,
@@ -251,13 +334,23 @@ def main() -> None:
         min_lr=cfg.min_lr,
     )
 
-    ckpt_dir = Path(cfg.checkpoint_dir) / f"n{cfg.n_disks}"
+    if len(cfg.train_n_disks) == 1 and len(cfg.test_n_disks) == 0 and cfg.data_mode == "flat-to-flat":
+        ckpt_subdir = f"n{cfg.n_disks}"
+    else:
+        train_tag = "-".join(str(n) for n in cfg.train_n_disks)
+        test_tag = "-".join(str(n) for n in cfg.test_n_disks) if cfg.test_n_disks else "none"
+        mode_tag = "tower" if cfg.data_mode == "tower-to-tower" else "flat"
+        ckpt_subdir = f"{mode_tag}_train_{train_tag}__test_{test_tag}"
+    ckpt_dir = Path(cfg.checkpoint_dir) / ckpt_subdir
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     best_metric = -1.0
     start_time = time.time()
 
     for epoch in range(1, cfg.num_epochs + 1):
+        do_val_eval = (epoch % cfg.eval_every) == 0 or epoch == cfg.num_epochs
+        do_test_eval = epoch == cfg.num_epochs
+
         train_loss, train_tok_acc = run_epoch(
             model=model,
             loader=train_loader,
@@ -267,38 +360,75 @@ def main() -> None:
             grad_clip=cfg.grad_clip,
         )
 
-        if val_loader is not None:
+        if do_val_eval and val_loader is not None:
             val_loss, val_tok_acc = run_epoch(model=model, loader=val_loader, device=device)
         else:
             val_loss, val_tok_acc = float("nan"), float("nan")
 
-        train_seq_acc = sequence_accuracy(
-            model=model,
-            dataset=train_ds,
-            eos_id=data.vocab.eos_id,
-            max_seq_len=data.max_seq_len,
-            device=device,
-        )
-
-        if val_ds is not None:
-            val_seq_acc = sequence_accuracy(
-                model=model,
-                dataset=val_ds,
-                eos_id=data.vocab.eos_id,
-                max_seq_len=data.max_seq_len,
-                device=device,
-            )
-            score = val_seq_acc
+        if do_test_eval and test_loader is not None:
+            test_loss, test_tok_acc = run_epoch(model=model, loader=test_loader, device=device)
         else:
+            test_loss, test_tok_acc = float("nan"), float("nan")
+
+        if do_val_eval:
+            if cfg.seq_eval_include_train:
+                train_seq_max_examples = (
+                    cfg.seq_eval_max_examples
+                    if cfg.seq_eval_max_train_examples <= 0
+                    else cfg.seq_eval_max_train_examples
+                )
+                train_seq_acc = sequence_accuracy(
+                    model=model,
+                    dataset=train_ds,
+                    eos_id=data.vocab.eos_id,
+                    max_seq_len=data.max_seq_len,
+                    device=device,
+                    max_examples=train_seq_max_examples,
+                )
+            else:
+                train_seq_acc = float("nan")
+
+            if val_ds is not None:
+                val_seq_acc = sequence_accuracy(
+                    model=model,
+                    dataset=val_ds,
+                    eos_id=data.vocab.eos_id,
+                    max_seq_len=data.max_seq_len,
+                    device=device,
+                    max_examples=cfg.seq_eval_max_examples,
+                )
+                score = val_seq_acc
+            else:
+                val_seq_acc = float("nan")
+                score = train_seq_acc if cfg.seq_eval_include_train else train_tok_acc
+
+            if do_test_eval and test_ds is not None:
+                test_seq_acc = sequence_accuracy(
+                    model=model,
+                    dataset=test_ds,
+                    eos_id=data.vocab.eos_id,
+                    max_seq_len=data.max_seq_len,
+                    device=device,
+                    max_examples=cfg.seq_eval_max_examples,
+                )
+            else:
+                test_seq_acc = float("nan")
+        else:
+            train_seq_acc = float("nan")
             val_seq_acc = float("nan")
-            score = train_seq_acc
+            test_seq_acc = float("nan")
+            score = None
 
         elapsed = time.time() - start_time
         lr_now = scheduler.get_last_lr()[0]
         print(
             f"[Epoch {epoch:03d}] "
-            f"train_loss={train_loss:.4f} train_tok_acc={train_tok_acc:.4f} train_seq_acc={train_seq_acc:.4f} "
-            f"val_loss={val_loss:.4f} val_tok_acc={val_tok_acc:.4f} val_seq_acc={val_seq_acc:.4f} "
+            f"train_loss={format_metric(train_loss)} train_tok_acc={format_metric(train_tok_acc)} "
+            f"train_seq_acc={format_metric(train_seq_acc)} "
+            f"val_loss={format_metric(val_loss)} val_tok_acc={format_metric(val_tok_acc)} "
+            f"val_seq_acc={format_metric(val_seq_acc)} "
+            f"test_loss={format_metric(test_loss)} test_tok_acc={format_metric(test_tok_acc)} "
+            f"test_seq_acc={format_metric(test_seq_acc)} "
             f"lr={lr_now:.6e} elapsed={elapsed:.1f}s"
         )
 
@@ -309,10 +439,13 @@ def main() -> None:
             "val_loss": val_loss,
             "val_tok_acc": val_tok_acc,
             "val_seq_acc": val_seq_acc,
+            "test_loss": test_loss,
+            "test_tok_acc": test_tok_acc,
+            "test_seq_acc": test_seq_acc,
             "lr": lr_now,
         }
 
-        if score > best_metric:
+        if score is not None and score > best_metric:
             best_metric = score
             save_checkpoint(
                 path=ckpt_dir / "best.pt",
@@ -336,7 +469,7 @@ def main() -> None:
             )
 
     print("[INFO] Training complete.")
-    if cfg.n_disks == 3:
+    if len(cfg.train_n_disks) == 1 and cfg.train_n_disks[0] == 3:
         print(f"[INFO] Success target: sequence accuracy >= 0.99 (best={best_metric:.4f})")
     else:
         print(f"[INFO] Success target: sequence accuracy >= 0.95 (best={best_metric:.4f})")

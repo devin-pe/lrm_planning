@@ -91,6 +91,70 @@ def build_solution_cache(n_disks: int) -> Dict[PairKey, Tuple[MovePair, ...]]:
     return cache
 
 
+def build_canonical_tower_example(n_disks: int) -> Tuple[StateTuple, StateTuple, Tuple[MovePair, ...]]:
+    """Build canonical all-on-peg-0 -> all-on-peg-2 example for a given n."""
+    solver = TowersOfHanoiSolver()
+
+    start: StateTuple = tuple(0 for _ in range(n_disks))
+    goal: StateTuple = tuple(2 for _ in range(n_disks))
+
+    solution = solver.solve(
+        num_disks=n_disks,
+        initial_state=tuple_to_pegs(start, n_disks),
+        goal_state=tuple_to_pegs(goal, n_disks),
+    )
+    if solution is None:
+        raise RuntimeError(f"No canonical solution found for n_disks={n_disks}")
+
+    moves = tuple(move_triplet_to_pair(m) for m in solution)
+    return start, goal, moves
+
+
+def _top_disk_index_on_peg(state: StateTuple, peg: int) -> int | None:
+    for disk_idx, p in enumerate(state):
+        if p == peg:
+            return disk_idx
+    return None
+
+
+def _apply_move_to_state(state: StateTuple, move: MovePair) -> StateTuple:
+    src, dst = move
+    moving = _top_disk_index_on_peg(state, src)
+    if moving is None:
+        raise RuntimeError(f"Illegal move from empty peg: move={move}, state={state}")
+
+    top_dst = _top_disk_index_on_peg(state, dst)
+    if top_dst is not None and moving > top_dst:
+        raise RuntimeError(f"Illegal move placing larger on smaller: move={move}, state={state}")
+
+    out = list(state)
+    out[moving] = dst
+    return tuple(out)
+
+
+def build_recursive_tower_examples(n_disks: int) -> List[Tuple[StateTuple, StateTuple, Tuple[MovePair, ...]]]:
+    """Build recursive subproblems from states along one optimal canonical trajectory.
+
+    Each example uses an intermediate trajectory state as start and keeps the same
+    final goal (all disks on peg 2). Targets are the remaining optimal suffix moves.
+    """
+    start, goal, moves = build_canonical_tower_example(n_disks)
+
+    states: List[StateTuple] = [start]
+    cur = start
+    for mv in moves:
+        cur = _apply_move_to_state(cur, mv)
+        states.append(cur)
+
+    if states[-1] != goal:
+        raise RuntimeError(f"Canonical trajectory did not end at goal for n_disks={n_disks}")
+
+    examples: List[Tuple[StateTuple, StateTuple, Tuple[MovePair, ...]]] = []
+    for idx in range(len(moves)):
+        examples.append((states[idx], goal, moves[idx:]))
+    return examples
+
+
 def split_pairs_with_state_coverage(
     pair_items: List[Tuple[PairKey, Tuple[MovePair, ...]]],
     seed: int,
@@ -230,6 +294,7 @@ class ToHFlatDataset(Dataset):
 class DatasetBundle:
     train_dataset: ToHFlatDataset
     val_dataset: ToHFlatDataset | None
+    test_dataset: ToHFlatDataset | None
     vocab: Vocabulary
     max_seq_len: int
 
@@ -260,6 +325,131 @@ def build_datasets(n_disks: int, seed: int = 42) -> DatasetBundle:
     return DatasetBundle(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        test_dataset=None,
+        vocab=vocab,
+        max_seq_len=max_seq_len,
+    )
+
+
+def build_multi_n_datasets(
+    train_n_disks: Sequence[int],
+    test_n_disks: Sequence[int],
+    max_seq_len: int,
+    seed: int = 42,
+    val_ratio: float = 0.2,
+) -> DatasetBundle:
+    if not train_n_disks:
+        raise ValueError("train_n_disks must not be empty")
+
+    rng = random.Random(seed)
+
+    train_examples: List[Tuple[StateTuple, StateTuple, Tuple[MovePair, ...]]] = []
+    val_examples: List[Tuple[StateTuple, StateTuple, Tuple[MovePair, ...]]] = []
+    test_examples: List[Tuple[StateTuple, StateTuple, Tuple[MovePair, ...]]] = []
+
+    for n in train_n_disks:
+        cache = build_solution_cache(n)
+        pair_items = list(cache.items())
+
+        if val_ratio <= 0.0:
+            train_pairs = pair_items
+            split_val_pairs: List[Tuple[PairKey, Tuple[MovePair, ...]]] = []
+        elif val_ratio >= 1.0:
+            raise ValueError("val_ratio must satisfy 0 <= val_ratio < 1")
+        else:
+            train_pairs, split_val_pairs = split_pairs_with_state_coverage(
+                pair_items,
+                seed=rng.randint(0, 10**9),
+                train_ratio=1.0 - val_ratio,
+            )
+
+        train_examples.extend((k[0], k[1], v) for k, v in train_pairs)
+        val_examples.extend((k[0], k[1], v) for k, v in split_val_pairs)
+
+    for n in test_n_disks:
+        cache = build_solution_cache(n)
+        pair_items = list(cache.items())
+        test_examples.extend((k[0], k[1], v) for k, v in pair_items)
+
+    vocab = Vocabulary()
+    train_dataset = ToHFlatDataset(train_examples, vocab=vocab, max_seq_len=max_seq_len)
+    val_dataset = None if len(val_examples) == 0 else ToHFlatDataset(val_examples, vocab=vocab, max_seq_len=max_seq_len)
+    test_dataset = (
+        None if len(test_examples) == 0 else ToHFlatDataset(test_examples, vocab=vocab, max_seq_len=max_seq_len)
+    )
+
+    return DatasetBundle(
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        test_dataset=test_dataset,
+        vocab=vocab,
+        max_seq_len=max_seq_len,
+    )
+
+
+def build_tower_to_tower_multi_n_datasets(
+    train_n_disks: Sequence[int],
+    test_n_disks: Sequence[int],
+    max_seq_len: int,
+    seed: int = 42,
+    val_ratio: float = 0.2,
+    train_repeats: int = 1024,
+    test_repeats: int = 1,
+    data_strategy: str = "canonical-repeat",
+) -> DatasetBundle:
+    if not train_n_disks:
+        raise ValueError("train_n_disks must not be empty")
+    if train_repeats < 1:
+        raise ValueError("train_repeats must be >= 1")
+    if test_repeats < 1:
+        raise ValueError("test_repeats must be >= 1")
+
+    rng = random.Random(seed)
+
+    train_examples: List[Tuple[StateTuple, StateTuple, Tuple[MovePair, ...]]] = []
+    val_examples: List[Tuple[StateTuple, StateTuple, Tuple[MovePair, ...]]] = []
+    test_examples: List[Tuple[StateTuple, StateTuple, Tuple[MovePair, ...]]] = []
+
+    for n in train_n_disks:
+        if data_strategy == "recursive-states":
+            repeated = build_recursive_tower_examples(n)
+        else:
+            ex = build_canonical_tower_example(n)
+            repeated = [ex for _ in range(train_repeats)]
+        rng.shuffle(repeated)
+
+        if val_ratio <= 0.0:
+            train_split = repeated
+            val_split: List[Tuple[StateTuple, StateTuple, Tuple[MovePair, ...]]] = []
+        elif val_ratio >= 1.0:
+            raise ValueError("val_ratio must satisfy 0 <= val_ratio < 1")
+        else:
+            n_val = int(round(len(repeated) * val_ratio))
+            n_val = max(1, min(n_val, len(repeated) - 1))
+            val_split = repeated[:n_val]
+            train_split = repeated[n_val:]
+
+        train_examples.extend(train_split)
+        val_examples.extend(val_split)
+
+    for n in test_n_disks:
+        if data_strategy == "recursive-states":
+            test_examples.extend(build_recursive_tower_examples(n))
+        else:
+            ex = build_canonical_tower_example(n)
+            test_examples.extend(ex for _ in range(test_repeats))
+
+    vocab = Vocabulary()
+    train_dataset = ToHFlatDataset(train_examples, vocab=vocab, max_seq_len=max_seq_len)
+    val_dataset = None if len(val_examples) == 0 else ToHFlatDataset(val_examples, vocab=vocab, max_seq_len=max_seq_len)
+    test_dataset = (
+        None if len(test_examples) == 0 else ToHFlatDataset(test_examples, vocab=vocab, max_seq_len=max_seq_len)
+    )
+
+    return DatasetBundle(
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        test_dataset=test_dataset,
         vocab=vocab,
         max_seq_len=max_seq_len,
     )

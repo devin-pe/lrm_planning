@@ -43,10 +43,11 @@ echo "============================================="
 #   --checkpoint_dir toh_transformer/checkpoints
 
 # Stage 2: n=4 (target >=95% sequence accuracy)
-python toh_transformer/train.py \
+python -u toh_transformer/train.py \
   --n_disks 4 \
   --num_epochs 50 \
   --batch_size 64 \
+  --save_every 5 \
   --checkpoint_dir toh_transformer/checkpoints
 
 echo "Training runs completed."
