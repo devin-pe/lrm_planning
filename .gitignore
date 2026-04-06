@@ -15,6 +15,10 @@ toh_transformer/__pycache__
 toh_transformer/analysis_output/
 toh_transformer/eval_output
 toh_transformer/probe
+toh_transformer/activation_patching_output
+toh_transformer/old_activation_patching_output
 toh_transformer/probe_move_tokens_output
+toh_transformer/probe_multi_position_output
+toh_transformer/probe_nonlinear_output
 toh_transformer/probe_old__move_tokens_output
 toh_transformer/probe_trajectory
