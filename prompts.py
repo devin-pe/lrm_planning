@@ -6,7 +6,7 @@ to avoid duplication.
 """
 
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 CODE_SYSTEM_PROMPT =  """You are a code-executing AI agent with access to an E2B sandbox.
 
@@ -228,7 +228,9 @@ def states_are_equal(state1: List[List[int]], state2: List[List[int]]) -> bool:
 def create_nonstandard_prompt(
     num_disks: int, 
     problem_id: int,
-    seed: int
+    seed: int,
+    initial_state_override: Optional[List[List[int]]] = None,
+    goal_state_override: Optional[List[List[int]]] = None,
 ) -> Tuple[str, str, Dict]:
     """
     Create non-standard TOH prompt with random start and goal configurations.
@@ -244,16 +246,21 @@ def create_nonstandard_prompt(
     # Create deterministic RNG based on seed, num_disks, and problem_id
     problem_seed = seed + num_disks * 1000 + problem_id
     rng = random.Random(problem_seed)
-    
-    # Generate random initial and goal states
-    # Keep generating until they're different
-    initial_state = generate_valid_toh_state(num_disks, rng)
-    goal_state = generate_valid_toh_state(num_disks, rng)
-    
-    # Ensure initial and goal states are different
+
+    if initial_state_override is not None:
+        initial_state = [list(peg) for peg in initial_state_override]
+    else:
+        initial_state = generate_valid_toh_state(num_disks, rng)
+
+    if goal_state_override is not None:
+        goal_state = [list(peg) for peg in goal_state_override]
+    else:
+        goal_state = generate_valid_toh_state(num_disks, rng)
+
+    # Ensure initial and goal states are different when goal is not explicitly provided.
     max_attempts = 100
     attempts = 0
-    while states_are_equal(initial_state, goal_state) and attempts < max_attempts:
+    while goal_state_override is None and states_are_equal(initial_state, goal_state) and attempts < max_attempts:
         goal_state = generate_valid_toh_state(num_disks, rng)
         attempts += 1
     

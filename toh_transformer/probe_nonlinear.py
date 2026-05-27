@@ -11,6 +11,7 @@ import argparse
 import copy
 import itertools
 import json
+import math
 import random
 from collections import deque
 from pathlib import Path
@@ -28,27 +29,14 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from toh_transformer.config import default_model_hparams, max_seq_len_for_disks
+from toh_transformer import utils as utils
 from toh_transformer.data import Vocabulary
 from toh_transformer.model import ToHTransformer
 
 State = Tuple[int, ...]
 Edge = Tuple[int, int]
 
-EXPECTED_TOKEN_MAPPING = {
-    "P0": 0,
-    "P1": 1,
-    "P2": 2,
-    "M01": 3,
-    "M02": 4,
-    "M10": 5,
-    "M12": 6,
-    "M20": 7,
-    "M21": 8,
-    "BOS": 9,
-    "SEP": 10,
-    "EOS": 11,
-    "PAD": 12,
-}
+EXPECTED_TOKEN_MAPPING = utils.EXPECTED_TOKEN_MAPPING
 
 PROBE_SPECS: Dict[str, str] = {
     "small_mlp": "Small MLP",
@@ -79,73 +67,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--linear_baseline_acc", type=float, default=0.012)
     parser.add_argument("--linear_baseline_rho", type=float, default=0.289)
     return parser.parse_args()
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-
-def confirm_tokenizer_mapping(vocab: Vocabulary) -> None:
-    if vocab.stoi != EXPECTED_TOKEN_MAPPING:
-        raise ValueError(f"Tokenizer mapping mismatch: {vocab.stoi}")
-
-
-def resolve_checkpoint_path(path_str: str, n_disks: int) -> Path:
-    p = Path(path_str)
-    if p.exists():
-        return p
-    if path_str == "best.pt":
-        candidates = [
-            Path(f"toh_transformer/checkpoints/n{n_disks}/best.pt"),
-            Path("toh_transformer/checkpoints/flat_train_3-4-6__test_5/best.pt"),
-        ]
-        for cand in candidates:
-            if cand.exists():
-                print(f"[INFO] Checkpoint 'best.pt' not found; using {cand}")
-                return cand
-    raise FileNotFoundError(f"Checkpoint not found: {path_str}")
-
-
-def load_model(checkpoint_path: Path, n_disks: int, device: torch.device) -> ToHTransformer:
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    cfg = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
-
-    defaults = default_model_hparams(n_disks)
-    model = ToHTransformer(
-        vocab_size=len(Vocabulary()),
-        max_seq_len=int(cfg.get("max_seq_len", max_seq_len_for_disks(n_disks))),
-        n_layers=int(cfg.get("n_layers", defaults["n_layers"])),
-        n_heads=int(cfg.get("n_heads", defaults["n_heads"])),
-        d_model=int(cfg.get("d_model", defaults["d_model"])),
-        d_ff=int(cfg.get("d_ff", defaults["d_ff"])),
-        dropout=float(cfg.get("dropout", defaults["dropout"])),
-    ).to(device)
-
-    if isinstance(ckpt, dict) and "model_state" in ckpt:
-        state_dict = ckpt["model_state"]
-    elif isinstance(ckpt, dict):
-        state_dict = ckpt
-    else:
-        raise ValueError("Checkpoint format not recognized")
-
-    model.load_state_dict(state_dict, strict=True)
-    model.eval()
-    return model
-
-
-def enumerate_states(n_disks: int) -> List[State]:
-    return [tuple(s) for s in itertools.product((0, 1, 2), repeat=n_disks)]
-
-
-def top_disk_per_peg(state: State) -> List[Optional[int]]:
-    tops: List[Optional[int]] = [None, None, None]
-    for disk_idx, peg in enumerate(state):
-        top = tops[peg]
-        if top is None or disk_idx < top:
-            tops[peg] = disk_idx
-    return tops
 
 
 def legal_neighbors(state: State) -> List[State]:
@@ -197,16 +118,6 @@ def build_graph_and_distances(n_disks: int) -> Tuple[List[State], np.ndarray, Li
     return states, dist, sorted(edge_set)
 
 
-def build_context_ids(start: State, goal: State, vocab: Vocabulary) -> List[int]:
-    return [
-        vocab.bos_id,
-        *[vocab.stoi[f"P{p}"] for p in start],
-        vocab.sep_id,
-        *[vocab.stoi[f"P{p}"] for p in goal],
-        vocab.sep_id,
-    ]
-
-
 @torch.no_grad()
 def extract_sep2_activations(
     model: ToHTransformer,
@@ -233,74 +144,6 @@ def extract_sep2_activations(
 
 
 @torch.no_grad()
-def greedy_decode_ids(
-    model: ToHTransformer,
-    context_ids: Sequence[int],
-    eos_id: int,
-    device: torch.device,
-) -> Tuple[List[int], bool]:
-    seq = torch.tensor(context_ids, dtype=torch.long, device=device).unsqueeze(0)
-    generated: List[int] = []
-    while seq.size(1) < model.max_seq_len:
-        logits = model(seq)
-        next_id = int(torch.argmax(logits[:, -1, :], dim=-1).item())
-        generated.append(next_id)
-        seq = torch.cat([seq, torch.tensor([[next_id]], dtype=torch.long, device=device)], dim=1)
-        if next_id == eos_id:
-            return generated, True
-    return generated, False
-
-
-def decode_move_token(tok: str) -> Optional[Tuple[int, int]]:
-    if len(tok) != 3 or tok[0] != "M":
-        return None
-    if tok[1] not in "012" or tok[2] not in "012":
-        return None
-    src, dst = int(tok[1]), int(tok[2])
-    if src == dst:
-        return None
-    return src, dst
-
-
-def apply_move_and_next_state(state: State, move: Tuple[int, int]) -> Optional[State]:
-    src, dst = move
-    tops = top_disk_per_peg(state)
-    src_top = tops[src]
-    dst_top = tops[dst]
-    if src_top is None:
-        return None
-    if dst_top is not None and src_top > dst_top:
-        return None
-    nxt = list(state)
-    nxt[src_top] = dst
-    return tuple(nxt)
-
-
-def load_correct_optimal_problems(eval_results_path: Path, n_disks: int) -> List[Tuple[State, State]]:
-    with eval_results_path.open("r", encoding="utf-8") as f:
-        rows = json.load(f)
-
-    out: List[Tuple[State, State]] = []
-    seen = set()
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if row.get("category") != "CORRECT_OPTIMAL":
-            continue
-        s_raw = row.get("start")
-        g_raw = row.get("goal")
-        if not isinstance(s_raw, list) or not isinstance(g_raw, list):
-            continue
-        if len(s_raw) != n_disks or len(g_raw) != n_disks:
-            continue
-        pair = (tuple(int(x) for x in s_raw), tuple(int(x) for x in g_raw))
-        if pair in seen:
-            continue
-        seen.add(pair)
-        out.append(pair)
-    return out
-
-
 def capture_move_position_activations(
     model: ToHTransformer,
     full_sequence: Sequence[int],
@@ -551,8 +394,20 @@ def compute_spearman_heldout(
     num_pairs: int,
     seed: int,
 ) -> float:
+    rho, _ = compute_corr_heldout(proj, y_state_idx, dist_true, val_idx, num_pairs, seed)
+    return rho
+
+
+def compute_corr_heldout(
+    proj: np.ndarray,
+    y_state_idx: np.ndarray,
+    dist_true: np.ndarray,
+    val_idx: np.ndarray,
+    num_pairs: int,
+    seed: int,
+) -> Tuple[float, float]:
     if val_idx.shape[0] < 2:
-        return float("nan")
+        return float("nan"), float("nan")
 
     rng = np.random.default_rng(seed)
     m = max(1, num_pairs)
@@ -561,7 +416,7 @@ def compute_spearman_heldout(
     b = rng.integers(0, val_idx.shape[0], size=m)
     mask = a != b
     if not np.any(mask):
-        return float("nan")
+        return float("nan"), float("nan")
 
     ia = val_idx[a[mask]]
     ib = val_idx[b[mask]]
@@ -571,8 +426,12 @@ def compute_spearman_heldout(
 
     rho, _ = spearmanr(pred, true)
     if not np.isfinite(rho):
-        return float("nan")
-    return float(rho)
+        rho = float("nan")
+    pred_c = pred.astype(np.float64) - pred.mean()
+    true_c = true.astype(np.float64) - true.mean()
+    denom = math.sqrt(float(np.sum(pred_c * pred_c) * np.sum(true_c * true_c)))
+    pearson = float(np.sum(pred_c * true_c) / denom) if denom > 0 else float("nan")
+    return float(rho), pearson
 
 
 def split_early_mid_late(step_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -779,6 +638,19 @@ def plot_training_curves(
     plt.close(fig)
 
 
+set_seed = utils.set_seed
+confirm_tokenizer_mapping = utils.confirm_tokenizer_mapping
+resolve_checkpoint_path = utils.resolve_checkpoint_path
+load_model = utils.load_model
+enumerate_states = utils.enumerate_states
+build_context_ids = utils.build_context_ids
+top_disk_per_peg = utils.top_disk_per_peg
+decode_move_token = utils.decode_move_token
+apply_move_and_next_state = utils.apply_move_and_next_state
+greedy_decode_ids = utils.greedy_decode_ids
+load_correct_optimal_problems = utils.load_correct_optimal_problems
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -889,6 +761,12 @@ def main() -> None:
             layout_spearman, _ = spearmanr(ref_pairwise.reshape(-1), dist_true.reshape(-1))
             if not np.isfinite(layout_spearman):
                 layout_spearman = float("nan")
+            _ref_p = ref_pairwise.reshape(-1).astype(np.float64)
+            _ref_p -= _ref_p.mean()
+            _true_p = dist_true.reshape(-1).astype(np.float64)
+            _true_p -= _true_p.mean()
+            _denom = math.sqrt(float(np.sum(_ref_p * _ref_p) * np.sum(_true_p * _true_p)))
+            layout_pearson = float(np.sum(_ref_p * _true_p) / _denom) if _denom > 0 else float("nan")
 
             proj_all = project_with_probe(trained_probe, x, device=device)
             proj_val = proj_all[val_idx]
@@ -902,7 +780,7 @@ def main() -> None:
             mid_val = (step_val >= 6) & (step_val <= 10)
             late_val = (step_val >= 11) & (step_val <= 15)
 
-            rho = compute_spearman_heldout(
+            rho, pearson = compute_corr_heldout(
                 proj=proj_all,
                 y_state_idx=y_state_idx,
                 dist_true=dist_true,
@@ -917,17 +795,20 @@ def main() -> None:
                 "layer": layer,
                 "nearest_state_acc": float(acc),
                 "spearman_rho": float(rho),
+                "pearson_r": float(pearson),
                 "early_acc": masked_accuracy(early_val, correct),
                 "mid_acc": masked_accuracy(mid_val, correct),
                 "late_acc": masked_accuracy(late_val, correct),
                 "val_loss": float(best_val_loss),
                 "layout_spearman": float(layout_spearman),
+                "layout_pearson": float(layout_pearson),
                 "best_epoch": int(best_epoch),
                 "train_curve": [float(v) for v in train_curve],
                 "val_curve": [float(v) for v in val_curve],
                 "ref_positions": ref_positions,
                 "val_proj": proj_val,
                 "val_y": y_val,
+                "trained_probe": trained_probe,
             }
 
             probe_rows.append(row)
@@ -1059,6 +940,9 @@ def main() -> None:
                 "layer": int(r["layer"]),
                 "nearest_state_acc": float(r["nearest_state_acc"]),
                 "spearman_rho": float(r["spearman_rho"]),
+                "pearson_r": float(r["pearson_r"]),
+                "layout_spearman": float(r["layout_spearman"]),
+                "layout_pearson": float(r["layout_pearson"]),
                 "early_acc": float(r["early_acc"]),
                 "mid_acc": float(r["mid_acc"]),
                 "late_acc": float(r["late_acc"]),
@@ -1068,6 +952,13 @@ def main() -> None:
                 "val_curve": r["val_curve"],
             }
         )
+        try:
+            torch.save(
+                r["trained_probe"].state_dict(),
+                out_dir / f"{r['probe_key']}_layer_{int(r['layer']):02d}.pt",
+            )
+        except Exception as e:
+            print(f"[WARN] Could not save probe state dict for {r['probe_key']} layer {r['layer']}: {e}")
 
     payload = {
         "config": {
@@ -1090,6 +981,7 @@ def main() -> None:
                 "layer": int(best_by_probe[k]["layer"]),
                 "nearest_state_acc": float(best_by_probe[k]["nearest_state_acc"]),
                 "spearman_rho": float(best_by_probe[k]["spearman_rho"]),
+                "pearson_r": float(best_by_probe[k]["pearson_r"]),
                 "best_epoch": int(best_by_probe[k]["best_epoch"]),
                 "val_loss": float(best_by_probe[k]["val_loss"]),
             }

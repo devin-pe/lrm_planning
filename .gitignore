@@ -22,3 +22,5 @@ toh_transformer/probe_multi_position_output
 toh_transformer/probe_nonlinear_output
 toh_transformer/probe_old__move_tokens_output
 toh_transformer/probe_trajectory
+toh_transformer/representation_analysis_output
+outputs/

@@ -1,0 +1,68 @@
+{
+  "rows_by_layer": {
+    "4": [
+      {
+        "input": "Raw residual (SEP)",
+        "nearest_state_acc": 1.0,
+        "spearman_rho": 0.9343151512978505
+      },
+      {
+        "input": "SAE latent (SEP)",
+        "nearest_state_acc": 1.0,
+        "spearman_rho": 0.9349474379791203
+      },
+      {
+        "input": "Raw residual (move avg)",
+        "nearest_state_acc": 0.015733063700707785,
+        "spearman_rho": 0.9235950135338749
+      },
+      {
+        "input": "SAE latent (move avg)",
+        "nearest_state_acc": 0.03170879676440849,
+        "spearman_rho": 0.9343280366770307
+      }
+    ],
+    "5": [
+      {
+        "input": "Raw residual (SEP)",
+        "nearest_state_acc": 1.0,
+        "spearman_rho": 0.9354108080789222
+      },
+      {
+        "input": "SAE latent (SEP)",
+        "nearest_state_acc": 1.0,
+        "spearman_rho": 0.9350003500663576
+      },
+      {
+        "input": "Raw residual (move avg)",
+        "nearest_state_acc": 0.011809908998988877,
+        "spearman_rho": 0.9266180431955935
+      },
+      {
+        "input": "SAE latent (move avg)",
+        "nearest_state_acc": 0.021617795753286147,
+        "spearman_rho": 0.9225313330172378
+      }
+    ]
+  },
+  "best_per_layer": {
+    "4": {
+      "variant": "l1",
+      "layer": 4,
+      "expansion": 8,
+      "d_hidden": 1024,
+      "lambda": 4.0,
+      "topk_k": null,
+      "model_path": "toh_transformer/sae_analysis_output/sae_models/sae_l1_layer4_exp8_lam4.pt"
+    },
+    "5": {
+      "variant": "l1",
+      "layer": 5,
+      "expansion": 4,
+      "d_hidden": 512,
+      "lambda": 4.0,
+      "topk_k": null,
+      "model_path": "toh_transformer/sae_analysis_output/sae_models/sae_l1_layer5_exp4_lam4.pt"
+    }
+  }
+}

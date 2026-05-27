@@ -1,0 +1,126 @@
+{
+  "rows_by_layer": {
+    "4": [
+      {
+        "input": "Raw residual (SEP)",
+        "nearest_state_acc": 1.0,
+        "spearman_rho": 0.9343151512978505
+      },
+      {
+        "input": "SAE latent (SEP)",
+        "nearest_state_acc": 1.0,
+        "spearman_rho": 0.9349474379791203
+      },
+      {
+        "input": "Raw residual (move)",
+        "nearest_state_acc": 0.01583417593528817,
+        "spearman_rho": 0.15501366218922213,
+        "avg_top1_neighbor_adj": 0.30864197530864196,
+        "avg_top3_neighbor_adj": 0.5432098765432098,
+        "avg_mean_neighbor_rank": 18.633333333333333,
+        "per_sample_acc": 0.01583417593528817,
+        "full_space_sample_acc": 0.24078867542972698
+      },
+      {
+        "input": "SAE latent (move)",
+        "nearest_state_acc": 0.029221435793731043,
+        "spearman_rho": 0.16980004655333464,
+        "avg_top1_neighbor_adj": 0.16049382716049382,
+        "avg_top3_neighbor_adj": 0.30864197530864196,
+        "avg_mean_neighbor_rank": 24.929166666666667,
+        "per_sample_acc": 0.029221435793731043,
+        "full_space_sample_acc": 0.050212335692618806
+      }
+    ],
+    "5": [
+      {
+        "input": "Raw residual (SEP)",
+        "nearest_state_acc": 1.0,
+        "spearman_rho": 0.9354108080789222
+      },
+      {
+        "input": "SAE latent (SEP)",
+        "nearest_state_acc": 1.0,
+        "spearman_rho": 0.9350003500663576
+      },
+      {
+        "input": "Raw residual (move)",
+        "nearest_state_acc": 0.008998988877654197,
+        "spearman_rho": 0.1364516118071087,
+        "avg_top1_neighbor_adj": 0.20987654320987653,
+        "avg_top3_neighbor_adj": 0.37037037037037035,
+        "avg_mean_neighbor_rank": 19.595833333333335,
+        "per_sample_acc": 0.008998988877654197,
+        "full_space_sample_acc": 0.20705763397371083
+      },
+      {
+        "input": "SAE latent (move)",
+        "nearest_state_acc": 0.017391304347826087,
+        "spearman_rho": 0.13996719628390167,
+        "avg_top1_neighbor_adj": 0.24691358024691357,
+        "avg_top3_neighbor_adj": 0.4074074074074074,
+        "avg_mean_neighbor_rank": 25.183333333333334,
+        "per_sample_acc": 0.017391304347826087,
+        "full_space_sample_acc": 0.05053589484327604
+      }
+    ]
+  },
+  "move_metric_summary": {
+    "4": {
+      "raw": {
+        "avg_top1_neighbor_adj": 0.30864197530864196,
+        "avg_top3_neighbor_adj": 0.5432098765432098,
+        "avg_mean_neighbor_rank": 18.633333333333333,
+        "per_sample_acc": 0.01583417593528817,
+        "spearman_rho": 0.15501366218922213,
+        "full_space_sample_acc": 0.24078867542972698
+      },
+      "sae": {
+        "avg_top1_neighbor_adj": 0.16049382716049382,
+        "avg_top3_neighbor_adj": 0.30864197530864196,
+        "avg_mean_neighbor_rank": 24.929166666666667,
+        "per_sample_acc": 0.029221435793731043,
+        "spearman_rho": 0.16980004655333464,
+        "full_space_sample_acc": 0.050212335692618806
+      }
+    },
+    "5": {
+      "raw": {
+        "avg_top1_neighbor_adj": 0.20987654320987653,
+        "avg_top3_neighbor_adj": 0.37037037037037035,
+        "avg_mean_neighbor_rank": 19.595833333333335,
+        "per_sample_acc": 0.008998988877654197,
+        "spearman_rho": 0.1364516118071087,
+        "full_space_sample_acc": 0.20705763397371083
+      },
+      "sae": {
+        "avg_top1_neighbor_adj": 0.24691358024691357,
+        "avg_top3_neighbor_adj": 0.4074074074074074,
+        "avg_mean_neighbor_rank": 25.183333333333334,
+        "per_sample_acc": 0.017391304347826087,
+        "spearman_rho": 0.13996719628390167,
+        "full_space_sample_acc": 0.05053589484327604
+      }
+    }
+  },
+  "best_per_layer": {
+    "4": {
+      "variant": "l1",
+      "layer": 4,
+      "expansion": 8,
+      "d_hidden": 1024,
+      "lambda": 4.0,
+      "topk_k": null,
+      "model_path": "toh_transformer/sae_analysis_output/sae_models/sae_l1_layer4_exp8_lam4.pt"
+    },
+    "5": {
+      "variant": "l1",
+      "layer": 5,
+      "expansion": 4,
+      "d_hidden": 512,
+      "lambda": 4.0,
+      "topk_k": null,
+      "model_path": "toh_transformer/sae_analysis_output/sae_models/sae_l1_layer5_exp4_lam4.pt"
+    }
+  }
+}

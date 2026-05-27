@@ -215,25 +215,45 @@ def draw_sierpinski_top_down_3disk(optimal_states=None, suboptimal_states=None):
     plt.figure(figsize=(12, 12))
     ax = plt.gca()
 
-    label_offset = 0.015
+    label_offset = 0.022
 
     label_to_coord = {}
     for i, (x, y) in enumerate(sorted_coords):
         label = user_labels[i]
         label_to_coord[label] = (x, y)
 
-        ax.scatter(x, y, color='black', s=20, zorder=3)
+        ax.scatter(x, y, color='black', s=40, zorder=3)
         ax.text(
             x,
             y + label_offset,
             str(label),
-            fontsize=8,
+            fontsize=16,
             ha='center',
             va='bottom',
             color='black',
             fontweight='bold',
             zorder=4,
         )
+
+    # Draw grey dotted lines for all valid Hanoi moves between states
+    n = 3
+    all_states = ["".join(seq) for seq in itertools.product("123", repeat=n)]
+    for u, v in itertools.combinations(all_states, 2):
+        diff_indices = [i for i in range(n) if u[i] != v[i]]
+        if len(diff_indices) != 1:
+            continue
+        disk_idx = diff_indices[0]
+        u_peg, v_peg = u[disk_idx], v[disk_idx]
+        is_valid = True
+        for smaller_idx in range(0, disk_idx):
+            if u[smaller_idx] == u_peg or u[smaller_idx] == v_peg:
+                is_valid = False
+                break
+        if is_valid and u in label_to_coord and v in label_to_coord:
+            x1, y1 = label_to_coord[u]
+            x2, y2 = label_to_coord[v]
+            ax.plot([x1, x2], [y1, y2], color='grey', linestyle=':',
+                    linewidth=1.2, alpha=0.7, zorder=1)
 
     def draw_path_edges(path_states, color):
         if not path_states:
@@ -283,9 +303,6 @@ def draw_sierpinski_top_down_3disk(optimal_states=None, suboptimal_states=None):
 # suboptimal_states_kimi = ['3313', '2313', '2113', '3113', '3213', '2213', '2233', '1233', '1333']
 
 if __name__ == '__main__':
-    draw_sierpinski_top_down(
-        optimal_states=optimal_states_kimi,
-        suboptimal_states=suboptimal_states_kimi,
-    )
+    draw_sierpinski_top_down_3disk()
 
 

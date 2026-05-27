@@ -21,6 +21,7 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from toh_transformer.config import TrainConfig, parse_train_args
+from toh_transformer import utils
 from toh_transformer.data import (
     DatasetBundle,
     ToHFlatDataset,
@@ -31,10 +32,7 @@ from toh_transformer.data import (
 from toh_transformer.model import ToHTransformer
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+set_seed = utils.set_seed
 
 
 def masked_ce_and_accuracy(

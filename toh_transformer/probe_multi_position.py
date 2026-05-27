@@ -27,27 +27,14 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from toh_transformer.config import default_model_hparams, max_seq_len_for_disks
+from toh_transformer import utils as utils
 from toh_transformer.data import Vocabulary
 from toh_transformer.model import ToHTransformer
 
 State = Tuple[int, ...]
 Edge = Tuple[int, int]
 
-EXPECTED_TOKEN_MAPPING = {
-    "P0": 0,
-    "P1": 1,
-    "P2": 2,
-    "M01": 3,
-    "M02": 4,
-    "M10": 5,
-    "M12": 6,
-    "M20": 7,
-    "M21": 8,
-    "BOS": 9,
-    "SEP": 10,
-    "EOS": 11,
-    "PAD": 12,
-}
+EXPECTED_TOKEN_MAPPING = utils.EXPECTED_TOKEN_MAPPING
 
 WINDOW_SIZES = [1, 2, 3, 5, 8, 15]
 
@@ -72,73 +59,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-
-def confirm_tokenizer_mapping(vocab: Vocabulary) -> None:
-    if vocab.stoi != EXPECTED_TOKEN_MAPPING:
-        raise ValueError(f"Tokenizer mapping mismatch: {vocab.stoi}")
-
-
-def resolve_checkpoint_path(path_str: str, n_disks: int) -> Path:
-    p = Path(path_str)
-    if p.exists():
-        return p
-    if path_str == "best.pt":
-        candidates = [
-            Path(f"toh_transformer/checkpoints/n{n_disks}/best.pt"),
-            Path("toh_transformer/checkpoints/flat_train_3-4-6__test_5/best.pt"),
-        ]
-        for cand in candidates:
-            if cand.exists():
-                print(f"[INFO] Checkpoint 'best.pt' not found; using {cand}")
-                return cand
-    raise FileNotFoundError(f"Checkpoint not found: {path_str}")
-
-
-def load_model(checkpoint_path: Path, n_disks: int, device: torch.device) -> ToHTransformer:
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    cfg = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
-
-    defaults = default_model_hparams(n_disks)
-    model = ToHTransformer(
-        vocab_size=len(Vocabulary()),
-        max_seq_len=int(cfg.get("max_seq_len", max_seq_len_for_disks(n_disks))),
-        n_layers=int(cfg.get("n_layers", defaults["n_layers"])),
-        n_heads=int(cfg.get("n_heads", defaults["n_heads"])),
-        d_model=int(cfg.get("d_model", defaults["d_model"])),
-        d_ff=int(cfg.get("d_ff", defaults["d_ff"])),
-        dropout=float(cfg.get("dropout", defaults["dropout"])),
-    ).to(device)
-
-    if isinstance(ckpt, dict) and "model_state" in ckpt:
-        state_dict = ckpt["model_state"]
-    elif isinstance(ckpt, dict):
-        state_dict = ckpt
-    else:
-        raise ValueError("Checkpoint format not recognized")
-
-    model.load_state_dict(state_dict, strict=True)
-    model.eval()
-    return model
-
-
-def enumerate_states(n_disks: int) -> List[State]:
-    return [tuple(s) for s in itertools.product((0, 1, 2), repeat=n_disks)]
-
-
-def top_disk_per_peg(state: State) -> List[Optional[int]]:
-    tops: List[Optional[int]] = [None, None, None]
-    for disk_idx, peg in enumerate(state):
-        top = tops[peg]
-        if top is None or disk_idx < top:
-            tops[peg] = disk_idx
-    return tops
 
 
 def legal_neighbors(state: State) -> List[State]:
@@ -190,85 +110,7 @@ def build_graph_and_distances(n_disks: int) -> Tuple[List[State], np.ndarray, Li
     return states, dist, sorted(edge_set)
 
 
-def build_context_ids(start: State, goal: State, vocab: Vocabulary) -> List[int]:
-    return [
-        vocab.bos_id,
-        *[vocab.stoi[f"P{p}"] for p in start],
-        vocab.sep_id,
-        *[vocab.stoi[f"P{p}"] for p in goal],
-        vocab.sep_id,
-    ]
-
-
 @torch.no_grad()
-def greedy_decode_ids(
-    model: ToHTransformer,
-    context_ids: Sequence[int],
-    eos_id: int,
-    device: torch.device,
-) -> Tuple[List[int], bool]:
-    seq = torch.tensor(context_ids, dtype=torch.long, device=device).unsqueeze(0)
-    generated: List[int] = []
-    while seq.size(1) < model.max_seq_len:
-        logits = model(seq)
-        next_id = int(torch.argmax(logits[:, -1, :], dim=-1).item())
-        generated.append(next_id)
-        seq = torch.cat([seq, torch.tensor([[next_id]], dtype=torch.long, device=device)], dim=1)
-        if next_id == eos_id:
-            return generated, True
-    return generated, False
-
-
-def decode_move_token(tok: str) -> Optional[Tuple[int, int]]:
-    if len(tok) != 3 or tok[0] != "M":
-        return None
-    if tok[1] not in "012" or tok[2] not in "012":
-        return None
-    src, dst = int(tok[1]), int(tok[2])
-    if src == dst:
-        return None
-    return src, dst
-
-
-def apply_move_and_next_state(state: State, move: Tuple[int, int]) -> Optional[State]:
-    src, dst = move
-    tops = top_disk_per_peg(state)
-    src_top = tops[src]
-    dst_top = tops[dst]
-    if src_top is None:
-        return None
-    if dst_top is not None and src_top > dst_top:
-        return None
-    nxt = list(state)
-    nxt[src_top] = dst
-    return tuple(nxt)
-
-
-def load_correct_optimal_problems(eval_results_path: Path, n_disks: int) -> List[Tuple[State, State]]:
-    with eval_results_path.open("r", encoding="utf-8") as f:
-        rows = json.load(f)
-
-    out: List[Tuple[State, State]] = []
-    seen = set()
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if row.get("category") != "CORRECT_OPTIMAL":
-            continue
-        s_raw = row.get("start")
-        g_raw = row.get("goal")
-        if not isinstance(s_raw, list) or not isinstance(g_raw, list):
-            continue
-        if len(s_raw) != n_disks or len(g_raw) != n_disks:
-            continue
-        pair = (tuple(int(x) for x in s_raw), tuple(int(x) for x in g_raw))
-        if pair in seen:
-            continue
-        seen.add(pair)
-        out.append(pair)
-    return out
-
-
 @torch.no_grad()
 def extract_sep2_activations(
     model: ToHTransformer,
@@ -469,9 +311,21 @@ def project_with_probe(probe: nn.Linear, x: np.ndarray, device: torch.device, ch
     return np.concatenate(out, axis=0)
 
 
-def nearest_state_predictions(proj: np.ndarray, ref_positions: np.ndarray) -> np.ndarray:
+def nearest_state_predictions(
+    proj: np.ndarray,
+    ref_positions: np.ndarray,
+    ref_state_indices: np.ndarray,
+) -> np.ndarray:
     d_ref = np.linalg.norm(proj[:, None, :] - ref_positions[None, :, :], axis=-1)
-    return np.argmin(d_ref, axis=1)
+    nearest_ref_idx = np.argmin(d_ref, axis=1)
+    return ref_state_indices[nearest_ref_idx]
+
+
+def _pearson(x: np.ndarray, y: np.ndarray) -> float:
+    xc = x.astype(np.float64) - x.mean()
+    yc = y.astype(np.float64) - y.mean()
+    denom = float(np.sqrt(np.sum(xc * xc) * np.sum(yc * yc)))
+    return float(np.sum(xc * yc) / denom) if denom > 0 else float("nan")
 
 
 def compute_spearman_on_validation(
@@ -481,8 +335,19 @@ def compute_spearman_on_validation(
     val_idx: np.ndarray,
     seed: int,
 ) -> float:
+    rho, _ = compute_corr_on_validation(proj, y_state_idx, dist_true, val_idx, seed)
+    return rho
+
+
+def compute_corr_on_validation(
+    proj: np.ndarray,
+    y_state_idx: np.ndarray,
+    dist_true: np.ndarray,
+    val_idx: np.ndarray,
+    seed: int,
+) -> Tuple[float, float]:
     if val_idx.shape[0] < 2:
-        return float("nan")
+        return float("nan"), float("nan")
 
     n = int(val_idx.shape[0])
     max_exact = 2500
@@ -490,10 +355,11 @@ def compute_spearman_on_validation(
     if n <= max_exact:
         x = proj[val_idx]
         y = y_state_idx[val_idx]
-        pred_mat = np.linalg.norm(x[:, None, :] - x[None, :, :], axis=-1)
-        true_mat = dist_true[y][:, y]
-        rho, _ = spearmanr(pred_mat.reshape(-1), true_mat.reshape(-1))
-        return float(rho) if np.isfinite(rho) else float("nan")
+        pred_mat = np.linalg.norm(x[:, None, :] - x[None, :, :], axis=-1).reshape(-1)
+        true_mat = dist_true[y][:, y].reshape(-1)
+        rho, _ = spearmanr(pred_mat, true_mat)
+        rho = float(rho) if np.isfinite(rho) else float("nan")
+        return rho, _pearson(pred_mat, true_mat)
 
     rng = np.random.default_rng(seed)
     num_pairs = 200000
@@ -501,7 +367,7 @@ def compute_spearman_on_validation(
     b = rng.integers(0, n, size=num_pairs)
     mask = a != b
     if not np.any(mask):
-        return float("nan")
+        return float("nan"), float("nan")
 
     a = a[mask]
     b = b[mask]
@@ -511,7 +377,8 @@ def compute_spearman_on_validation(
     pred = np.linalg.norm(proj[ia] - proj[ib], axis=1)
     true = dist_true[y_state_idx[ia], y_state_idx[ib]]
     rho, _ = spearmanr(pred, true)
-    return float(rho) if np.isfinite(rho) else float("nan")
+    rho = float(rho) if np.isfinite(rho) else float("nan")
+    return rho, _pearson(pred, true)
 
 
 def split_early_mid_late(step_idx: np.ndarray, n_disks: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -542,17 +409,13 @@ def build_reference_positions(
     first_step_ref_for_states: Dict[int, np.ndarray],
     k: int,
     device: torch.device,
-) -> np.ndarray:
-    n_states, d_model = sep_layer_acts.shape
-    refs = np.zeros((n_states, k * d_model), dtype=np.float32)
-
-    for state_idx in range(n_states):
-        if state_idx in first_step_ref_for_states:
-            refs[state_idx] = first_step_ref_for_states[state_idx]
-        else:
-            refs[state_idx] = np.tile(sep_layer_acts[state_idx], k)
-
-    return project_with_probe(probe, refs, device=device)
+) -> Tuple[np.ndarray, np.ndarray]:
+    del sep_layer_acts, k
+    ref_state_indices = np.array(sorted(first_step_ref_for_states.keys()), dtype=np.int64)
+    if ref_state_indices.size == 0:
+        raise RuntimeError("Strict mode: no first-step reference anchors available")
+    refs = np.stack([first_step_ref_for_states[int(i)] for i in ref_state_indices], axis=0).astype(np.float32)
+    return project_with_probe(probe, refs, device=device), ref_state_indices
 
 
 def pct(x: float) -> str:
@@ -561,50 +424,172 @@ def pct(x: float) -> str:
     return f"{100.0 * x:.2f}%"
 
 
-def plot_best_scatter(
-    out_path: Path,
+def plot_best_visualizations(
+    out_dir: Path,
     best_proj: np.ndarray,
     best_y_state_idx: np.ndarray,
     ref_positions: np.ndarray,
+    ref_state_indices: np.ndarray,
     states: Sequence[State],
     edges: Sequence[Edge],
+    best_k: int,
+    best_layer: int,
+    seed: int,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(10, 8))
+    state_colors = {
+        0: "#e74c3c",  # red
+        1: "#3498db",  # blue
+        2: "#2ecc71",  # green
+    }
 
-    for i, j in edges:
-        ax.plot(
+    ref_color_values = np.array([
+        states[int(i)][3] if len(states[int(i)]) >= 4 else states[int(i)][-1] for i in ref_state_indices
+    ])
+    ref_colors = np.array([state_colors[int(v)] for v in ref_color_values])
+
+    sample_color_values = np.array([
+        states[int(idx)][3] if len(states[int(idx)]) >= 4 else states[int(idx)][-1] for idx in best_y_state_idx
+    ])
+    sample_colors = np.array([state_colors[int(v)] for v in sample_color_values])
+
+    ref_index_map = {int(s_idx): local_i for local_i, s_idx in enumerate(ref_state_indices)}
+    filtered_edges = [
+        (ref_index_map[i], ref_index_map[j]) for i, j in edges if i in ref_index_map and j in ref_index_map
+    ]
+
+    # Figure 1: reference layout only.
+    fig1, ax1 = plt.subplots(figsize=(10, 8))
+    for i, j in filtered_edges:
+        ax1.plot(
             [ref_positions[i, 0], ref_positions[j, 0]],
             [ref_positions[i, 1], ref_positions[j, 1]],
-            color="lightgray",
-            linewidth=0.7,
-            alpha=0.55,
+            color="gray",
+            linewidth=1.0,
+            alpha=0.5,
             zorder=1,
         )
 
-    colors = np.array([states[idx][3] if len(states[idx]) >= 4 else states[idx][-1] for idx in best_y_state_idx])
-    sc = ax.scatter(
-        best_proj[:, 0],
-        best_proj[:, 1],
-        c=colors,
-        cmap="viridis",
-        s=8,
-        alpha=0.35,
+    ax1.scatter(
+        ref_positions[:, 0],
+        ref_positions[:, 1],
+        c=ref_colors,
+        s=80,
+        alpha=0.95,
         zorder=2,
     )
-    ax.scatter(ref_positions[:, 0], ref_positions[:, 1], c="black", s=18, alpha=0.8, zorder=3)
 
-    cbar = fig.colorbar(sc, ax=ax)
-    cbar.set_label("Largest disk position (state[3])")
+    for i, state_idx in enumerate(ref_state_indices):
+        state = states[int(state_idx)]
+        ax1.text(
+            ref_positions[i, 0],
+            ref_positions[i, 1],
+            str(tuple(state)),
+            fontsize=6,
+            ha="center",
+            va="center",
+            color="black",
+            zorder=3,
+        )
 
-    ax.set_title("Best (K, layer): projected points with state-graph edges")
-    ax.set_xlabel("Probe dim 1")
-    ax.set_ylabel("Probe dim 2")
-    ax.set_aspect("equal", adjustable="box")
-    ax.grid(alpha=0.2)
+    ax1.set_title(f"Reference Sierpinski Layout (K={best_k}, Layer {best_layer})")
+    ax1.set_xlabel("Probe dim 1")
+    ax1.set_ylabel("Probe dim 2")
+    ax1.set_aspect("equal", adjustable="box")
+    ax1.grid(alpha=0.2)
+    fig1.tight_layout()
+    fig1.savefig(out_dir / "best_k_layer_reference_layout.png", dpi=300)
+    plt.close(fig1)
 
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=300)
-    plt.close(fig)
+    # Figure 2: subsampled move-token overlay.
+    fig2, ax2 = plt.subplots(figsize=(10, 8))
+    for i, j in filtered_edges:
+        ax2.plot(
+            [ref_positions[i, 0], ref_positions[j, 0]],
+            [ref_positions[i, 1], ref_positions[j, 1]],
+            color="gray",
+            linewidth=1.0,
+            alpha=0.5,
+            zorder=1,
+        )
+
+    ax2.scatter(
+        ref_positions[:, 0],
+        ref_positions[:, 1],
+        c=ref_colors,
+        s=60,
+        edgecolors="black",
+        linewidths=0.6,
+        alpha=0.98,
+        zorder=3,
+    )
+
+    rng = np.random.default_rng(seed)
+    n_total = best_proj.shape[0]
+    n_subsample = min(2000, n_total)
+    sel = rng.choice(n_total, size=n_subsample, replace=False)
+    ax2.scatter(
+        best_proj[sel, 0],
+        best_proj[sel, 1],
+        c=sample_colors[sel],
+        s=3,
+        alpha=0.15,
+        linewidths=0.0,
+        zorder=2,
+    )
+
+    ax2.set_title("Move-Token Projections Overlaid on Reference Layout")
+    ax2.set_xlabel("Probe dim 1")
+    ax2.set_ylabel("Probe dim 2")
+    ax2.set_aspect("equal", adjustable="box")
+    ax2.grid(alpha=0.2)
+    fig2.tight_layout()
+    fig2.savefig(out_dir / "best_k_layer_overlay_subsample.png", dpi=300)
+    plt.close(fig2)
+
+    # Figure 3: density heatmap with references on top.
+    fig3, ax3 = plt.subplots(figsize=(10, 8))
+    hb = ax3.hexbin(
+        best_proj[:, 0],
+        best_proj[:, 1],
+        gridsize=80,
+        cmap="Greys",
+        mincnt=1,
+        linewidths=0.0,
+        alpha=0.9,
+        zorder=1,
+    )
+    cbar = fig3.colorbar(hb, ax=ax3)
+    cbar.set_label("Move-token density")
+
+    for i, j in filtered_edges:
+        ax3.plot(
+            [ref_positions[i, 0], ref_positions[j, 0]],
+            [ref_positions[i, 1], ref_positions[j, 1]],
+            color="gray",
+            linewidth=1.0,
+            alpha=0.5,
+            zorder=2,
+        )
+
+    ax3.scatter(
+        ref_positions[:, 0],
+        ref_positions[:, 1],
+        c=ref_colors,
+        s=60,
+        edgecolors="black",
+        linewidths=0.6,
+        alpha=0.98,
+        zorder=3,
+    )
+
+    ax3.set_title("Density of Move-Token Projections")
+    ax3.set_xlabel("Probe dim 1")
+    ax3.set_ylabel("Probe dim 2")
+    ax3.set_aspect("equal", adjustable="box")
+    ax3.grid(alpha=0.2)
+    fig3.tight_layout()
+    fig3.savefig(out_dir / "best_k_layer_density_hexbin.png", dpi=300)
+    plt.close(fig3)
 
 
 def plot_k_curve(out_path: Path, k_values: Sequence[int], acc_values: Sequence[float], layer: int) -> None:
@@ -618,6 +603,19 @@ def plot_k_curve(out_path: Path, k_values: Sequence[int], acc_values: Sequence[f
     fig.tight_layout()
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
+
+
+set_seed = utils.set_seed
+confirm_tokenizer_mapping = utils.confirm_tokenizer_mapping
+resolve_checkpoint_path = utils.resolve_checkpoint_path
+load_model = utils.load_model
+enumerate_states = utils.enumerate_states
+build_context_ids = utils.build_context_ids
+top_disk_per_peg = utils.top_disk_per_peg
+decode_move_token = utils.decode_move_token
+apply_move_and_next_state = utils.apply_move_and_next_state
+greedy_decode_ids = utils.greedy_decode_ids
+load_correct_optimal_problems = utils.load_correct_optimal_problems
 
 
 def main() -> None:
@@ -726,57 +724,75 @@ def main() -> None:
                 k=k,
                 device=device,
             )
+            ref_positions, ref_state_indices = ref_positions
 
             proj = project_with_probe(probe, x, device=device)
-            nearest = nearest_state_predictions(proj, ref_positions)
+            available_anchor_mask = np.isin(y_state_idx, ref_state_indices)
+            nearest = nearest_state_predictions(proj, ref_positions, ref_state_indices)
             correct = nearest == y_state_idx
 
-            acc = float(np.mean(correct))
-            rho = compute_spearman_on_validation(
+            acc = masked_accuracy(available_anchor_mask, correct)
+            rho, pearson = compute_corr_on_validation(
                 proj=proj,
                 y_state_idx=y_state_idx,
                 dist_true=dist_true,
                 val_idx=val_idx,
                 seed=args.seed + 5000 + 100 * k + layer,
             )
-            early_acc = masked_accuracy(early_mask, correct)
-            mid_acc = masked_accuracy(mid_mask, correct)
-            late_acc = masked_accuracy(late_mask, correct)
+            early_acc = masked_accuracy(early_mask & available_anchor_mask, correct)
+            mid_acc = masked_accuracy(mid_mask & available_anchor_mask, correct)
+            late_acc = masked_accuracy(late_mask & available_anchor_mask, correct)
+            n_ref_states = int(ref_state_indices.shape[0])
+            anchor_coverage = n_ref_states / len(states)
 
             row = {
                 "K": float(k),
                 "layer": float(layer),
                 "nearest_state_acc": acc,
                 "spearman_rho": rho,
+                "pearson_r": pearson,
                 "early_acc": early_acc,
                 "mid_acc": mid_acc,
                 "late_acc": late_acc,
                 "final_loss": float(final_loss),
+                "n_ref_states": float(n_ref_states),
+                "anchor_coverage": float(anchor_coverage),
             }
             results_rows.append(row)
             k_rows.append(row)
 
-            if best_global is None or acc > float(best_global["nearest_state_acc"]):
+            try:
+                torch.save(
+                    probe.state_dict(),
+                    out_dir / f"multi_position_K{k}_layer_{layer:02d}.pt",
+                )
+            except Exception as e:
+                print(f"[WARN] Could not save probe for K={k} layer={layer}: {e}")
+
+            if np.isfinite(acc) and (best_global is None or acc > float(best_global["nearest_state_acc"])):
                 best_global = {
                     "K": k,
                     "layer": layer,
                     "nearest_state_acc": acc,
                     "spearman_rho": rho,
+                    "pearson_r": pearson,
                     "proj": proj,
                     "y_state_idx": y_state_idx.copy(),
                     "ref_positions": ref_positions,
+                    "ref_state_indices": ref_state_indices.copy(),
                 }
 
         k_rows_sorted = sorted(k_rows, key=lambda r: (r["nearest_state_acc"], r["spearman_rho"]), reverse=True)
         best_by_k[k] = k_rows_sorted[0]
 
-    print("\nK  | Layer | Nearest-State Acc | Spearman rho | Early Acc | Mid Acc | Late Acc")
-    print("---+-------+-------------------+--------------+-----------+---------+---------")
+    print("\nK  | Layer | Nearest-State Acc | Spearman rho | Early Acc | Mid Acc | Late Acc | Anchor Coverage")
+    print("---+-------+-------------------+--------------+-----------+---------+---------+----------------")
     rows_sorted = sorted(results_rows, key=lambda r: (int(r["K"]), int(r["layer"])))
     for r in rows_sorted:
         print(
             f"{int(r['K']):2d} | {int(r['layer']):5d} | {pct(r['nearest_state_acc']):>17} | "
-            f"{r['spearman_rho']:12.4f} | {pct(r['early_acc']):>9} | {pct(r['mid_acc']):>7} | {pct(r['late_acc']):>8}"
+            f"{r['spearman_rho']:12.4f} | {pct(r['early_acc']):>9} | {pct(r['mid_acc']):>7} | {pct(r['late_acc']):>8} | "
+            f"{pct(r['anchor_coverage']):>14}"
         )
 
     print("\nK  | Best Layer | Nearest-State Acc | Spearman rho")
@@ -798,13 +814,17 @@ def main() -> None:
         f"rho={float(best_global['spearman_rho']):.4f}"
     )
 
-    plot_best_scatter(
-        out_path=out_dir / "best_k_layer_scatter.png",
+    plot_best_visualizations(
+        out_dir=out_dir,
         best_proj=np.asarray(best_global["proj"]),
         best_y_state_idx=np.asarray(best_global["y_state_idx"]),
         ref_positions=np.asarray(best_global["ref_positions"]),
+        ref_state_indices=np.asarray(best_global["ref_state_indices"]),
         states=states,
         edges=edges,
+        best_k=best_k,
+        best_layer=best_layer,
+        seed=args.seed,
     )
 
     acc_curve = [best_by_k[k]["nearest_state_acc"] if int(best_by_k[k]["layer"]) == best_layer else float("nan") for k in WINDOW_SIZES]
@@ -839,6 +859,9 @@ def main() -> None:
             "layer": best_layer,
             "nearest_state_acc": float(best_global["nearest_state_acc"]),
             "spearman_rho": float(best_global["spearman_rho"]),
+            "pearson_r": float(best_global["pearson_r"]),
+            "n_ref_states": int(np.asarray(best_global["ref_state_indices"]).shape[0]),
+            "anchor_coverage": float(np.asarray(best_global["ref_state_indices"]).shape[0] / len(states)),
         },
     }
     (out_dir / "multi_position_probe_results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")

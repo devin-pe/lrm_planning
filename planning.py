@@ -405,7 +405,16 @@ class NonStandardValidator:
     ) -> Dict:
         moves = self.parse_moves(response)
 
-        if moves is None:
+        if moves is None or not isinstance(moves, list):
+            return {
+                'success': False,
+                'error': 'Failed to parse moves',
+                'violations': 1,
+                'num_moves': 0,
+                'solved': False,
+            }
+
+        if not all(isinstance(move, list) for move in moves):
             return {
                 'success': False,
                 'error': 'Failed to parse moves',
@@ -493,22 +502,17 @@ class MoveParser:
             re.compile(r'[Dd]isk\s+(\d+)[:\s]+(\d+)\s*(?:->|→|to)\s*(\d+)'),
         ]
 
-        self.final_moves_pattern = re.compile(
-            r'moves\s*=\s*(\[(?:\s*\[[^\]]+\]\s*,?\s*)+\])',
-            re.DOTALL,
-        )
-
     def parse_final_moves(self, text: str) -> Optional[List[List[int]]]:
+        # Old regex `moves\s*=\s*(\[(?:\s*\[[^\]]+\]\s*,?\s*)+\])` had catastrophic
+        # backtracking on truncated/malformed model outputs. Use depth-counter
+        # extractor instead.
         text_outside_think = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-        matches = self.final_moves_pattern.findall(text_outside_think)
-        if not matches:
+        moves_str = _extract_moves_block(text_outside_think)
+        if moves_str is None:
             return None
-
-        moves_str = matches[-1].strip()
         try:
-            moves = json.loads(moves_str)
-            return moves
-        except json.JSONDecodeError:
+            return _parse_moves_json(moves_str)
+        except (json.JSONDecodeError, ValueError):
             return None
 
     def parse_intermediate_moves(self, text: str) -> List[Tuple[int, List[int]]]:

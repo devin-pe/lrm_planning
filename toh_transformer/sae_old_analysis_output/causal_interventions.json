@@ -1,0 +1,171 @@
+{
+  "top_features": [
+    {
+      "feature": 905,
+      "label": "disk_1_on_peg_1",
+      "label_meta": {
+        "type": "disk_position",
+        "disk": 1,
+        "value": 1,
+        "concentration": 0.7499494438827098,
+        "mutual_info": 0.08791800932124809
+      },
+      "preferred_next_move": "M10",
+      "preferred_next_concentration": 0.24420529801324503,
+      "activation_success": 0,
+      "activation_total": 50,
+      "suppression_success": 0,
+      "suppression_total": 50,
+      "disruption_count": 0,
+      "disruption_total": 100
+    }
+  ],
+  "activation_success_rate": 0.0,
+  "suppression_success_rate": 0.0,
+  "disruption_rate": 0.0,
+  "activation_trials": 50,
+  "suppression_trials": 50,
+  "disruption_trials": 100,
+  "examples": [
+    {
+      "feature": 905,
+      "mode": "activation",
+      "start": [
+        1,
+        0,
+        2,
+        0
+      ],
+      "goal": [
+        0,
+        2,
+        1,
+        2
+      ],
+      "step_index": 3,
+      "clean_next": "M01",
+      "patched_next": "M01",
+      "suffix_legal": true,
+      "suffix_reaches_goal": true,
+      "patched_moves": [
+        "M01",
+        "M21",
+        "M02",
+        "M10",
+        "M12"
+      ]
+    },
+    {
+      "feature": 905,
+      "mode": "activation",
+      "start": [
+        1,
+        1,
+        2,
+        0
+      ],
+      "goal": [
+        2,
+        2,
+        1,
+        1
+      ],
+      "step_index": 7,
+      "clean_next": "M21",
+      "patched_next": "M21",
+      "suffix_legal": true,
+      "suffix_reaches_goal": true,
+      "patched_moves": [
+        "M21",
+        "M01",
+        "M02",
+        "M12"
+      ]
+    },
+    {
+      "feature": 905,
+      "mode": "activation",
+      "start": [
+        1,
+        1,
+        0,
+        1
+      ],
+      "goal": [
+        1,
+        0,
+        1,
+        2
+      ],
+      "step_index": 6,
+      "clean_next": "M12",
+      "patched_next": "M12",
+      "suffix_legal": true,
+      "suffix_reaches_goal": true,
+      "patched_moves": [
+        "M12",
+        "M01",
+        "M21",
+        "M20"
+      ]
+    },
+    {
+      "feature": 905,
+      "mode": "activation",
+      "start": [
+        0,
+        0,
+        2,
+        1
+      ],
+      "goal": [
+        1,
+        2,
+        2,
+        0
+      ],
+      "step_index": 4,
+      "clean_next": "M21",
+      "patched_next": "M21",
+      "suffix_legal": true,
+      "suffix_reaches_goal": true,
+      "patched_moves": [
+        "M21"
+      ]
+    },
+    {
+      "feature": 905,
+      "mode": "activation",
+      "start": [
+        2,
+        1,
+        0,
+        0
+      ],
+      "goal": [
+        2,
+        2,
+        0,
+        2
+      ],
+      "step_index": 1,
+      "clean_next": "M12",
+      "patched_next": "M12",
+      "suffix_legal": true,
+      "suffix_reaches_goal": true,
+      "patched_moves": [
+        "M12",
+        "M02",
+        "M01",
+        "M20",
+        "M21",
+        "M01",
+        "M02",
+        "M10",
+        "M12",
+        "M02",
+        "M10"
+      ]
+    }
+  ]
+}

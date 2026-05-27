@@ -1,0 +1,31 @@
+{
+  "rows": [
+    {
+      "disk": 0,
+      "linear_probe_raw": 1.0,
+      "logistic_sae_z": 0.9996966632962588,
+      "chance": 0.3333333333333333
+    },
+    {
+      "disk": 1,
+      "linear_probe_raw": 0.9996966632962588,
+      "logistic_sae_z": 0.9993933265925177,
+      "chance": 0.3333333333333333
+    },
+    {
+      "disk": 2,
+      "linear_probe_raw": 0.9133468149646107,
+      "logistic_sae_z": 0.9572295247724975,
+      "chance": 0.3333333333333333
+    },
+    {
+      "disk": 3,
+      "linear_probe_raw": 0.8138523761375126,
+      "logistic_sae_z": 0.9149646107178969,
+      "chance": 0.3333333333333333
+    }
+  ],
+  "mean_linear_probe_raw": 0.9317239635995955,
+  "mean_logistic_sae_z": 0.9678210313447927,
+  "chance": 0.3333333333333333
+}

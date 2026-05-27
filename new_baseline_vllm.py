@@ -1,0 +1,280 @@
+"""
+New Baseline Evaluation: Local vLLM server on Towers of Hanoi
+
+Same problem generation and validation logic as new_baseline.py but talks to a
+local vLLM OpenAI-compatible server instead of OpenRouter.
+"""
+
+import os
+import re
+import json
+import time
+from datetime import datetime
+from openai import OpenAI
+from planning import (
+    BaselineProblemGenerator,
+    TowersOfHanoiValidator,
+    NonStandardValidator,
+)
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+NUM_PROBLEMS = 25
+DISK_RANGE = [3, 4, 5]
+SEED = 42
+PROBLEM_MODE = "nonstandard"
+
+# vLLM server (started externally, e.g. by the job script)
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
+MODEL_NAME = "qwen3.6-27b"
+
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "12288"))
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
+TOP_P = float(os.environ.get("TOP_P", "0.95"))
+TOP_K = int(os.environ.get("TOP_K", "20"))
+MIN_P = float(os.environ.get("MIN_P", "0.0"))
+
+OUTPUT_DIR = "./new_baseline_results"
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _parse_disk_range(value: str) -> list[int]:
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    return [int(p) for p in parts]
+
+
+# ============================================================================
+# Client Setup
+# ============================================================================
+
+client = OpenAI(
+    api_key=os.environ.get("VLLM_API_KEY", "EMPTY"),
+    base_url=VLLM_BASE_URL,
+)
+
+
+# ============================================================================
+# Solution Generation
+# ============================================================================
+
+def extract_think_tags(text: str) -> tuple[str, str]:
+    """Extract reasoning from <think> tags and return (reasoning, answer)."""
+    pattern = r"<think>(.*?)</think>"
+    matches = re.findall(pattern, text, re.DOTALL)
+    if matches:
+        reasoning = "\n\n".join(m.strip() for m in matches)
+        answer = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+        return reasoning, answer
+    return "", text
+
+
+def query_model(system_prompt: str, user_prompt: str) -> dict:
+    """Query the local vLLM server."""
+    try:
+        print(f"  Sending request to {MODEL_NAME}...", flush=True)
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=TEMPERATURE,
+            top_p=TOP_P,
+            max_tokens=MAX_TOKENS,
+            extra_body={
+                "top_k": TOP_K,
+                "min_p": MIN_P,
+            },
+        )
+
+        raw_content = response.choices[0].message.content or ""
+        reasoning, answer = extract_think_tags(raw_content)
+        finish_reason = response.choices[0].finish_reason or "unknown"
+
+        usage = {
+            "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+            "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+            "total_tokens": response.usage.total_tokens if response.usage else 0,
+        }
+
+        return {
+            "reasoning": reasoning,
+            "answer": answer,
+            "raw_content": raw_content,
+            "finish_reason": finish_reason,
+            "usage": usage,
+        }
+
+    except Exception as e:
+        print(f"  Error querying model: {e}")
+        return {
+            "reasoning": "",
+            "answer": "",
+            "raw_content": "",
+            "finish_reason": "error",
+            "usage": {},
+            "error": str(e),
+        }
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    global MODEL_NAME
+
+    model_name = os.environ.get("MODEL_NAME", MODEL_NAME)
+    MODEL_NAME = model_name
+    num_problems = int(os.environ.get("NUM_PROBLEMS", NUM_PROBLEMS))
+    disk_range = _parse_disk_range(os.environ.get("DISK_RANGE", ",".join(map(str, DISK_RANGE))))
+    seed = int(os.environ.get("SEED", SEED))
+    problem_mode = os.environ.get("PROBLEM_MODE", PROBLEM_MODE).strip().lower()
+    if problem_mode not in {"standard", "nonstandard"}:
+        raise ValueError(f"Invalid PROBLEM_MODE={problem_mode}")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    run_dir = os.path.join(OUTPUT_DIR, f"run_{TIMESTAMP}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    print(
+        f"Configuration: model={model_name}, mode={problem_mode}, "
+        f"num_problems={num_problems}, disk_range={disk_range}, seed={seed}"
+    )
+    print(f"vLLM base URL: {VLLM_BASE_URL}")
+
+    problems = BaselineProblemGenerator.generate_problems(
+        num_problems=num_problems,
+        min_disks=min(disk_range),
+        max_disks=max(disk_range),
+        seed=seed,
+        mode=problem_mode,
+    )
+    validator = TowersOfHanoiValidator() if problem_mode == "standard" else NonStandardValidator()
+
+    manifest_path = os.path.join(run_dir, "problems.json")
+    with open(manifest_path, "w") as f:
+        json.dump(problems, f, indent=2)
+    print(f"Saved {len(problems)} problems to {manifest_path}")
+
+    total_problems = len(problems)
+    results = []
+
+    for p in problems:
+        pid = p["problem_id"]
+        print(
+            f"\n[Problem {pid + 1}/{total_problems}] "
+            f"disks={p['num_disks']} "
+            f"initial={p['problem_info']['initial_state']} "
+            f"goal={p['problem_info']['goal_state']}"
+        )
+
+        start_time = time.time()
+        response = query_model(p["system_prompt"], p["user_prompt"])
+        elapsed = time.time() - start_time
+
+        response_text = response.get("raw_content") or response.get("answer") or ""
+        if problem_mode == "standard":
+            reward, violations = validator.validate_trace(
+                response_text,
+                {"num_disks": p["num_disks"], "goal_peg": p.get("goal_peg", 2)},
+            )
+            num_moves = None
+            parse_ok = True
+            try:
+                parsed_moves = validator.parse_moves(response_text)
+                num_moves = len(parsed_moves)
+            except ValueError:
+                parse_ok = False
+
+            solved = reward >= 1.0
+            optimal_moves = 2 ** p["num_disks"] - 1
+            is_optimal = solved and violations == 0 and parse_ok and num_moves == optimal_moves
+            validation = {
+                "success": parse_ok,
+                "violations": violations,
+                "num_moves": num_moves,
+                "solved": solved,
+                "reward": reward,
+                "optimal_moves": optimal_moves,
+                "is_optimal": is_optimal,
+                "extra_moves": (
+                    (num_moves - optimal_moves) if (solved and parse_ok and num_moves is not None) else None
+                ),
+            }
+        else:
+            validation = validator.validate(
+                response_text,
+                p["problem_info"]["initial_state"],
+                p["problem_info"]["goal_state"],
+                p["num_disks"],
+            )
+            if "is_optimal" not in validation:
+                validation["is_optimal"] = False
+
+        result = {
+            **p,
+            "response": response,
+            "validation": validation,
+            "is_optimal": bool(validation.get("is_optimal", False)),
+            "elapsed_seconds": round(elapsed, 2),
+        }
+        results.append(result)
+
+        out_path = os.path.join(run_dir, f"problem_{pid:03d}.json")
+        with open(out_path, "w") as f:
+            json.dump(result, f, indent=2)
+
+        print(
+            f"  Time: {elapsed:.1f}s | "
+            f"Tokens: {response.get('usage', {}).get('total_tokens', '?')} | "
+            f"Finish: {response.get('finish_reason', '?')} | "
+            f"Solved: {validation.get('solved', False)} | "
+            f"Violations: {validation.get('violations', '?')}"
+        )
+
+    combined_path = os.path.join(run_dir, "all_results.json")
+    with open(combined_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    solved_count = sum(1 for r in results if r.get("validation", {}).get("solved", False))
+    optimal_count = sum(1 for r in results if r.get("validation", {}).get("is_optimal", False))
+    per_disk_total: dict = {}
+    per_disk_solved: dict = {}
+    per_disk_optimal: dict = {}
+    for r in results:
+        disk = r.get("num_disks")
+        if disk is None:
+            continue
+        per_disk_total[disk] = per_disk_total.get(disk, 0) + 1
+        if r.get("validation", {}).get("solved", False):
+            per_disk_solved[disk] = per_disk_solved.get(disk, 0) + 1
+        if r.get("validation", {}).get("is_optimal", False):
+            per_disk_optimal[disk] = per_disk_optimal.get(disk, 0) + 1
+
+    avg_violations = (
+        sum(r.get("validation", {}).get("violations", 0) for r in results) / len(results)
+        if results else 0.0
+    )
+
+    print(f"\nAll results saved to {combined_path}")
+    print(f"Solved: {solved_count}/{len(results)} ({100 * solved_count / len(results):.1f}%)")
+    print(f"Optimal: {optimal_count}/{len(results)} ({100 * optimal_count / len(results):.1f}%)")
+    if per_disk_total:
+        print("Solved/Optimal by disk:")
+        for disk in sorted(per_disk_total):
+            solved = per_disk_solved.get(disk, 0)
+            optimal = per_disk_optimal.get(disk, 0)
+            total = per_disk_total[disk]
+            print(
+                f"  {disk} disks: solved {solved}/{total} ({100 * solved / total:.1f}%), "
+                f"optimal {optimal}/{total} ({100 * optimal / total:.1f}%)"
+            )
+    print(f"Average violations: {avg_violations:.2f}")
+
+
+if __name__ == "__main__":
+    main()

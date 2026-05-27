@@ -20,6 +20,7 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from umap import UMAP
 
+from toh_transformer import utils
 from toh_transformer.data import Vocabulary
 from toh_transformer.model import ToHTransformer
 
@@ -65,29 +66,6 @@ def checkpoint_tag(checkpoint_path: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Model loading
-# ---------------------------------------------------------------------------
-
-def load_model(checkpoint_path: str, device: torch.device) -> ToHTransformer:
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg = ckpt["config"]
-    vocab = Vocabulary()
-    model = ToHTransformer(
-        vocab_size=len(vocab),
-        max_seq_len=cfg["max_seq_len"],
-        n_layers=cfg["n_layers"],
-        n_heads=cfg["n_heads"],
-        d_model=cfg["d_model"],
-        d_ff=cfg["d_ff"],
-        dropout=0.0,  # no dropout at inference
-    )
-    model.load_state_dict(ckpt["model_state"])
-    model.to(device)
-    model.eval()
-    return model
-
-
-# ---------------------------------------------------------------------------
-# State graph
 # ---------------------------------------------------------------------------
 
 def enumerate_all_states(n_disks: int) -> List[StateTuple]:
@@ -666,7 +644,7 @@ def main() -> None:
         run_output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\nLoading model from {checkpoint} ...")
-        model = load_model(checkpoint, device)
+        model = utils.load_model(Path(checkpoint), args.n_disks, device)
         n_layers = model.n_layers
         print(f"Model layers: {n_layers}")
         print(f"Output directory for this checkpoint: {run_output_dir}")
