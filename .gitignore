@@ -24,3 +24,4 @@ toh_transformer/probe_old__move_tokens_output
 toh_transformer/probe_trajectory
 toh_transformer/representation_analysis_output
 outputs/
+toh_transformer/sae_old_analysis_output/
