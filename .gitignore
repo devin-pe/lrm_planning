@@ -29,4 +29,6 @@ hanoi_data/train.jsonl
 hanoi_data/test.jsonl
 hanoi_data/__pycache__
 eval/__pycache__
+finetune/__pycache__
 runs/
+.claude/
