@@ -23,5 +23,10 @@ toh_transformer/probe_nonlinear_output
 toh_transformer/probe_old__move_tokens_output
 toh_transformer/probe_trajectory
 toh_transformer/representation_analysis_output
-outputs/
 toh_transformer/sae_old_analysis_output/
+outputs/
+hanoi_data/train.jsonl
+hanoi_data/test.jsonl
+hanoi_data/__pycache__
+eval/__pycache__
+runs/

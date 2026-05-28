@@ -384,14 +384,20 @@ def evaluate_probe(
     coords: np.ndarray,
     true_dist: np.ndarray,
     nbrs: Dict[int, Set[int]],
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     pred = np.linalg.norm(coords[:, None] - coords[None], axis=2)
     ui, uj = np.triu_indices(pred.shape[0], k=1)
-    rho, _ = spearmanr(pred[ui, uj], true_dist[ui, uj])
+    pred_pairs = pred[ui, uj]
+    true_pairs = true_dist[ui, uj]
+    rho, _ = spearmanr(pred_pairs, true_pairs)
+    pc = pred_pairs.astype(np.float64) - pred_pairs.mean()
+    tc = true_pairs.astype(np.float64) - true_pairs.mean()
+    denom = float(np.sqrt(np.sum(pc * pc) * np.sum(tc * tc)))
+    pearson = float(np.sum(pc * tc) / denom) if denom > 0 else float("nan")
     correct = sum(int(np.argmin(np.where(np.arange(len(coords)) == i,
                                          np.inf, pred[i]))) in nbrs[i]
                   for i in range(len(coords)))
-    return float(rho), correct / len(coords)
+    return float(rho), correct / len(coords), pearson
 
 
 # ── Per-disk logistic regression ───────────────────────────────────────────────
@@ -539,23 +545,36 @@ def main() -> None:
     state_has_B: List[bool] = [False] * len(states)
     state_is_correct: List[bool] = [False] * len(states)
 
-    # Load evaluation results to know correct/failed
+    # Load evaluation results to know correct/failed.
+    # Qwen jobs write evaluate_qwen_results.json with {records: [{state, category, ...}]}.
+    # DeepSeek jobs write validation_results.json as a list of {state_tuple, passed, ...}.
     _eval_dir = Path(args.generated_texts).parent
-    eval_path = (
-        _eval_dir / "evaluate_results.json"
-        if (_eval_dir / "evaluate_results.json").exists()
-        else _eval_dir / "evaluate_qwen_results.json"
-    )
+    candidate_eval_paths = [
+        _eval_dir / "evaluate_results.json",
+        _eval_dir / "evaluate_qwen_results.json",
+        _eval_dir / "validation_results.json",
+    ]
+    eval_path = next((p for p in candidate_eval_paths if p.exists()), candidate_eval_paths[-1])
+
     correct_states: Set[str] = set()
     if eval_path.exists():
         with open(eval_path) as f:
             eval_data = json.load(f)
-        correct_cats = {"CORRECT_OPTIMAL", "CORRECT_SUBOPTIMAL"}
-        for rec in eval_data.get("records", []):
-            if rec["category"] in correct_cats:
-                correct_states.add(rec["state"])
+        if isinstance(eval_data, dict) and "records" in eval_data:
+            correct_cats = {"CORRECT_OPTIMAL", "CORRECT_SUBOPTIMAL"}
+            for rec in eval_data["records"]:
+                if rec.get("category") in correct_cats:
+                    correct_states.add(rec["state"])
+        elif isinstance(eval_data, list):
+            for rec in eval_data:
+                if rec.get("passed"):
+                    st = rec.get("state_tuple") or rec.get("state")
+                    if st is not None:
+                        correct_states.add(str(tuple(int(x) for x in st)))
+        else:
+            print(f"[WARN] {eval_path} has unrecognized schema; correct/failed split unavailable")
     else:
-        print(f"[WARN] {eval_path} not found; correct/failed split unavailable")
+        print(f"[WARN] no eval file found in {_eval_dir}; correct/failed split unavailable")
 
     print(f"\n[INFO] Processing {len(states)} problems (one forward pass each)...")
 
@@ -694,13 +713,14 @@ def main() -> None:
                         for new_i in range(len(idxs_A))}
 
             coords_A, _ = train_probe(vecs_A, y_A, args.epochs, args.lr, device)
-            rho_A, adj_A = evaluate_probe(coords_A, sub_dist, sub_nbrs)
-            print(f"  Spearman={rho_A:.4f}  AdjAcc={adj_A:.4f}")
+            rho_A, adj_A, pearson_A = evaluate_probe(coords_A, sub_dist, sub_nbrs)
+            print(f"  Spearman={rho_A:.4f}  Pearson={pearson_A:.4f}  AdjAcc={adj_A:.4f}")
 
             disk_acc_A = per_disk_accuracy(vecs_A.numpy(), states_A, n_disks)
             print(f"  Per-disk acc: {[f'{a:.3f}' for a in disk_acc_A]}")
 
             table_rows.append({"pos": "A", "layer": l, "spearman": rho_A,
+                                "pearson": pearson_A,
                                 "adj_acc": adj_A, "disk_accs": disk_acc_A,
                                 "n": len(idxs_A)})
 
@@ -723,13 +743,14 @@ def main() -> None:
                           for new_i in range(len(idxs_B))}
 
             coords_B, _ = train_probe(vecs_B, y_B, args.epochs, args.lr, device)
-            rho_B, adj_B = evaluate_probe(coords_B, sub_dist_B, sub_nbrs_B)
-            print(f"  Spearman={rho_B:.4f}  AdjAcc={adj_B:.4f}")
+            rho_B, adj_B, pearson_B = evaluate_probe(coords_B, sub_dist_B, sub_nbrs_B)
+            print(f"  Spearman={rho_B:.4f}  Pearson={pearson_B:.4f}  AdjAcc={adj_B:.4f}")
 
             disk_acc_B = per_disk_accuracy(vecs_B.numpy(), states_B, n_disks)
             print(f"  Per-disk acc: {[f'{a:.3f}' for a in disk_acc_B]}")
 
             table_rows.append({"pos": "B", "layer": l, "spearman": rho_B,
+                                "pearson": pearson_B,
                                 "adj_acc": adj_B, "disk_accs": disk_acc_B,
                                 "n": len(idxs_B)})
 
@@ -772,9 +793,9 @@ def main() -> None:
                     g_states = [states_B[i] for i in gidx]
                     g_norm, _, _ = norm_dist(g_sub)
                     g_coords, _ = train_probe(g_vecs, torch.tensor(g_norm), args.epochs, args.lr, device)
-                    g_rho, g_adj = evaluate_probe(g_coords, g_sub, g_nbrs)
+                    g_rho, g_adj, g_pearson = evaluate_probe(g_coords, g_sub, g_nbrs)
                     g_disk_acc = per_disk_accuracy(g_vecs.numpy(), g_states, n_disks)
-                    print(f"  {group_name:8s} n={len(gidx):2d}  ρ={g_rho:.4f}  AdjAcc={g_adj:.4f}"
+                    print(f"  {group_name:8s} n={len(gidx):2d}  ρ={g_rho:.4f}  r={g_pearson:.4f}  AdjAcc={g_adj:.4f}"
                           f"  disk={[f'{a:.3f}' for a in g_disk_acc]}")
 
         # ── Position C (averaged per true state) ──────────────────────────────
@@ -802,10 +823,11 @@ def main() -> None:
                           for ni in range(len(c_idxs))}
 
                 c_coords, _ = train_probe(c_vecs_avg, torch.tensor(c_norm), args.epochs, args.lr, device)
-                rho_C, adj_C = evaluate_probe(c_coords, c_dist, c_nbrs)
-                print(f"  Spearman={rho_C:.4f}  AdjAcc={adj_C:.4f}  n_states={len(c_states_valid)}")
+                rho_C, adj_C, pearson_C = evaluate_probe(c_coords, c_dist, c_nbrs)
+                print(f"  Spearman={rho_C:.4f}  Pearson={pearson_C:.4f}  AdjAcc={adj_C:.4f}  n_states={len(c_states_valid)}")
 
                 table_rows.append({"pos": "C_avg", "layer": l, "spearman": rho_C,
+                                   "pearson": pearson_C,
                                    "adj_acc": adj_C, "disk_accs": [float("nan")] * n_disks,
                                    "n": len(c_states_valid)})
 
@@ -821,6 +843,7 @@ def main() -> None:
             print(f"  C per-disk acc (N={len(all_c_vecs)}): {[f'{a:.3f}' for a in disk_acc_C]}")
 
             table_rows.append({"pos": "C_perdisk", "layer": l, "spearman": float("nan"),
+                               "pearson": float("nan"),
                                "adj_acc": float("nan"), "disk_accs": disk_acc_C,
                                "n": len(all_c_vecs)})
 
@@ -876,20 +899,22 @@ def main() -> None:
                           out_dir / f"L{best_layer}_positions_comparison.png")
 
     # ── Print comparison table ─────────────────────────────────────────────────
-    print(f"\n{'='*90}")
+    print(f"\n{'='*100}")
     print("COMPARISON TABLE")
-    print(f"{'='*90}")
-    hdr = (f"{'Position':<20} {'Layer':>5} {'N':>4} {'Spearman':>10} "
+    print(f"{'='*100}")
+    hdr = (f"{'Position':<20} {'Layer':>5} {'N':>4} {'Spearman':>10} {'Pearson':>10} "
            f"{'AdjAcc':>8} {'Disk0':>7} {'Disk1':>7} {'Disk2':>7} {'Disk3':>7}")
     print(hdr)
-    print("-" * 90)
+    print("-" * 100)
     for r in table_rows:
         da = r["disk_accs"]
         def fmt(x):
             return f"{x:.3f}" if not math.isnan(x) else "  -  "
         spearman_str = f"{r['spearman']:.4f}" if not math.isnan(r["spearman"]) else "   -   "
+        pearson_val = r.get("pearson", float("nan"))
+        pearson_str = f"{pearson_val:.4f}" if not math.isnan(pearson_val) else "   -   "
         adj_str = f"{r['adj_acc']:.4f}" if not math.isnan(r["adj_acc"]) else "  -  "
-        print(f"{r['pos']:<20} {r['layer']:>5} {r['n']:>4} {spearman_str:>10} "
+        print(f"{r['pos']:<20} {r['layer']:>5} {r['n']:>4} {spearman_str:>10} {pearson_str:>10} "
               f"{adj_str:>8} {fmt(da[0]):>7} {fmt(da[1]):>7} {fmt(da[2]):>7} {fmt(da[3]):>7}")
 
     # Save table as JSON

@@ -4,17 +4,20 @@
       {
         "input": "Raw residual (SEP)",
         "nearest_state_acc": 1.0,
-        "spearman_rho": 0.9343151512978505
+        "spearman_rho": 0.9342450898342705,
+        "pearson_r": 0.8971607898602454
       },
       {
         "input": "SAE latent (SEP)",
         "nearest_state_acc": 1.0,
-        "spearman_rho": 0.9349474379791203
+        "spearman_rho": 0.9349474379791203,
+        "pearson_r": 0.9031808659929362
       },
       {
         "input": "Raw residual (move)",
         "nearest_state_acc": 0.01583417593528817,
-        "spearman_rho": 0.15501366218922213,
+        "spearman_rho": 0.15501556284101856,
+        "pearson_r": 0.1977557045418345,
         "avg_top1_neighbor_adj": 0.30864197530864196,
         "avg_top3_neighbor_adj": 0.5432098765432098,
         "avg_mean_neighbor_rank": 18.633333333333333,
@@ -24,7 +27,8 @@
       {
         "input": "SAE latent (move)",
         "nearest_state_acc": 0.029221435793731043,
-        "spearman_rho": 0.16980004655333464,
+        "spearman_rho": 0.16979997120644602,
+        "pearson_r": 0.21271156316740922,
         "avg_top1_neighbor_adj": 0.16049382716049382,
         "avg_top3_neighbor_adj": 0.30864197530864196,
         "avg_mean_neighbor_rank": 24.929166666666667,
@@ -36,27 +40,31 @@
       {
         "input": "Raw residual (SEP)",
         "nearest_state_acc": 1.0,
-        "spearman_rho": 0.9354108080789222
+        "spearman_rho": 0.9354092464881248,
+        "pearson_r": 0.8983484245988781
       },
       {
         "input": "SAE latent (SEP)",
         "nearest_state_acc": 1.0,
-        "spearman_rho": 0.9350003500663576
+        "spearman_rho": 0.9350001176583489,
+        "pearson_r": 0.9031534313961155
       },
       {
         "input": "Raw residual (move)",
         "nearest_state_acc": 0.008998988877654197,
-        "spearman_rho": 0.1364516118071087,
+        "spearman_rho": 0.1364173226054375,
+        "pearson_r": 0.16773915878352372,
         "avg_top1_neighbor_adj": 0.20987654320987653,
-        "avg_top3_neighbor_adj": 0.37037037037037035,
-        "avg_mean_neighbor_rank": 19.595833333333335,
+        "avg_top3_neighbor_adj": 0.35802469135802467,
+        "avg_mean_neighbor_rank": 19.616666666666667,
         "per_sample_acc": 0.008998988877654197,
         "full_space_sample_acc": 0.20705763397371083
       },
       {
         "input": "SAE latent (move)",
         "nearest_state_acc": 0.017391304347826087,
-        "spearman_rho": 0.13996719628390167,
+        "spearman_rho": 0.1399672546512098,
+        "pearson_r": 0.17847585088903087,
         "avg_top1_neighbor_adj": 0.24691358024691357,
         "avg_top3_neighbor_adj": 0.4074074074074074,
         "avg_mean_neighbor_rank": 25.183333333333334,
@@ -72,7 +80,8 @@
         "avg_top3_neighbor_adj": 0.5432098765432098,
         "avg_mean_neighbor_rank": 18.633333333333333,
         "per_sample_acc": 0.01583417593528817,
-        "spearman_rho": 0.15501366218922213,
+        "spearman_rho": 0.15501556284101856,
+        "pearson_r": 0.1977557045418345,
         "full_space_sample_acc": 0.24078867542972698
       },
       "sae": {
@@ -80,17 +89,19 @@
         "avg_top3_neighbor_adj": 0.30864197530864196,
         "avg_mean_neighbor_rank": 24.929166666666667,
         "per_sample_acc": 0.029221435793731043,
-        "spearman_rho": 0.16980004655333464,
+        "spearman_rho": 0.16979997120644602,
+        "pearson_r": 0.21271156316740922,
         "full_space_sample_acc": 0.050212335692618806
       }
     },
     "5": {
       "raw": {
         "avg_top1_neighbor_adj": 0.20987654320987653,
-        "avg_top3_neighbor_adj": 0.37037037037037035,
-        "avg_mean_neighbor_rank": 19.595833333333335,
+        "avg_top3_neighbor_adj": 0.35802469135802467,
+        "avg_mean_neighbor_rank": 19.616666666666667,
         "per_sample_acc": 0.008998988877654197,
-        "spearman_rho": 0.1364516118071087,
+        "spearman_rho": 0.1364173226054375,
+        "pearson_r": 0.16773915878352372,
         "full_space_sample_acc": 0.20705763397371083
       },
       "sae": {
@@ -98,7 +109,8 @@
         "avg_top3_neighbor_adj": 0.4074074074074074,
         "avg_mean_neighbor_rank": 25.183333333333334,
         "per_sample_acc": 0.017391304347826087,
-        "spearman_rho": 0.13996719628390167,
+        "spearman_rho": 0.1399672546512098,
+        "pearson_r": 0.17847585088903087,
         "full_space_sample_acc": 0.05053589484327604
       }
     }

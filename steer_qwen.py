@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Activation steering for Qwen3-27B on flat-to-flat Tower of Hanoi.
+"""Directional activation steering for LRMs on flat-to-flat Tower of Hanoi.
+
+Works with Qwen3-27B and DeepSeek-R1-Distill-Qwen-32B (any model whose
+hidden_states.pt + probe_layer_*.pt artifacts were produced by probe.py).
 
 Idea: the model encodes the state space cleanly at position A (last prompt
 token) with Spearman ~0.935 between probe-distance and graph-distance, but
@@ -8,23 +11,18 @@ clean steering targets and inject them into the residual stream during
 generation, updating the target each time the model commits a legal move.
 
 Pipeline:
-  1. Load layer-L position-A hidden states from outputs/qwen_probe/hidden_states.pt
+  1. Load layer-L position-A hidden states from <hidden_states.pt>
      → dict state_tuple → activation vector, plus the mean over all 81 states.
   2. Install a forward hook on layer-L that modifies the LAST-token residual
-     at every forward pass (prefill + each generation step):
-        directional: h[-1] += alpha * unit(target - mean)
-        blend:       h[-1] = (1 - beta) * h[-1] + beta * target
+     at every forward pass (prefill + each generation step) in DIRECTIONAL
+     mode:  h[-1] += alpha * unit(target - mean)
   3. Generate token-by-token with KV cache. When a ']' lands in the freshly
      decoded text, re-parse the LAST moves=[...] block from scratch, replay
      against the start state, and if the resulting board changes update the
      hook's target activation.
   4. Classify the final answer (CORRECT_OPTIMAL / CORRECT_SUBOPTIMAL /
      ILLEGAL_* / PARSE_ERROR / WRONG_GOAL_STATE).
-  5. Sweep alpha, beta, layer choices and print a comparison table.
-
-Optional oracle baseline (--run_oracle) generates ONE move at a time with
-the current state explicitly written into the prompt — an upper bound on
-what state-feedback alone could buy.
+  5. Sweep alpha and layer choices and print a comparison table.
 """
 
 from __future__ import annotations
@@ -72,7 +70,7 @@ CORRECT_CATEGORIES = {CORRECT_OPTIMAL, CORRECT_SUBOPTIMAL}
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Activation steering for Qwen ToH solving")
+    p = argparse.ArgumentParser(description="Directional activation steering for LRM ToH solving")
     p.add_argument("--model_name", default="Qwen/Qwen3-27B")
     p.add_argument("--hidden_states", default="outputs/qwen_probe/hidden_states.pt",
                    help="Position-A hidden states from probe.py")
@@ -82,33 +80,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--extra_layers", default="",
                    help="Comma-separated extra layers for joint steering, e.g. '48'")
     p.add_argument("--alphas", default="0.5,1,2,5,10,20")
-    p.add_argument("--betas", default="0.01,0.05,0.1,0.2,0.5")
-    p.add_argument("--modes", default="directional,blend",
-                   help="Comma-separated subset of {directional, blend}")
     p.add_argument("--run_baseline", action="store_true",
                    help="Run a no-steering pass for comparison")
-    p.add_argument("--run_oracle", action="store_true",
-                   help="Run the oracle (state-in-prompt) baseline")
     p.add_argument("--output_dir", default="outputs/qwen_steering")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", default="bfloat16",
                    choices=["float16", "bfloat16", "float32"])
     p.add_argument("--max_new_tokens", type=int, default=13000)
-    p.add_argument("--max_oracle_steps", type=int, default=30,
-                   help="Per-problem move cap for the oracle baseline")
-    p.add_argument("--oracle_max_new_tokens", type=int, default=2048,
-                   help="Token budget per oracle step")
     p.add_argument("--n_problems", type=int, default=81)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--probe_dir", default="outputs/qwen_probe",
                    help="Used by the Sierpinski plot of flipped problems")
     p.add_argument("--decode_every", type=int, default=1,
                    help="Decode/parse-state cadence in tokens. 1 == every step.")
+    p.add_argument("--batch_size", type=int, default=8,
+                   help="Number of problems to generate in parallel per sweep cell. "
+                        "1 = legacy single-problem path. KV-cache scales linearly.")
     p.add_argument("--save_texts", action="store_true",
                    help="Save full generated text per (condition, problem) — large")
     p.add_argument("--eval_results",
                    default="outputs/qwen_probe/evaluate_qwen_results.json",
-                   help="Path to evaluate_*_results.json used by --failed_only")
+                   help="Path to per-state eval results used by --failed_only. "
+                        "Accepts either {records: [{state_tuple, category}]} (Qwen) "
+                        "or a list of {state_tuple, passed} (DeepSeek validation_results.json).")
     p.add_argument("--failed_only", action="store_true",
                    help="Skip the states the model already solves in --eval_results")
     p.add_argument("--always_steer", action="store_true",
@@ -390,8 +384,7 @@ def get_layers_list(text_model: nn.Module):
 class SteeringHook:
     """Forward hook on one transformer layer; rewrites residual at the LAST tok.
 
-    mode='directional':  h[-1] += scale * unit(target - mean)
-    mode='blend':        h[-1]  = (1 - scale) * h[-1] + scale * target
+    Directional steering:  h[-1] += alpha * unit(target - mean)
 
     The hook is REGISTERED throughout but stays *dormant* (no-op) until
     `moves_phase_active` is flipped on. The generation loop turns it on the
@@ -400,15 +393,17 @@ class SteeringHook:
     steered forward passes from ~12k/problem to ~50–100.
     """
 
-    def __init__(self, layer_module: nn.Module, layer_id: int, mode: str, scale: float,
+    def __init__(self, layer_module: nn.Module, layer_id: int, alpha: float,
                  moves_phase_active: bool = False):
-        assert mode in ("directional", "blend"), mode
         self.layer_id = layer_id
-        self.mode = mode
-        self.scale = float(scale)
+        self.alpha = float(alpha)
+        # Scalar / single-row state (kept for backwards compat).
         self.target_vec: Optional[torch.Tensor] = None
         self.mean_vec: Optional[torch.Tensor] = None
         self.steering_unit: Optional[torch.Tensor] = None
+        # Batched state (overrides scalar when set).
+        self.steering_units_batched: Optional[torch.Tensor] = None  # (B, H)
+        self.moves_phase_mask: Optional[torch.Tensor] = None        # (B,) bool
         self.enabled = True
         self.moves_phase_active = moves_phase_active
         self.fired = 0
@@ -417,10 +412,19 @@ class SteeringHook:
     def update_target(self, target_vec: torch.Tensor, mean_vec: torch.Tensor) -> None:
         self.target_vec = target_vec
         self.mean_vec = mean_vec
-        if self.mode == "directional":
-            diff = target_vec - mean_vec
-            n = float(diff.norm())
-            self.steering_unit = diff / n if n > 1e-8 else diff.clone()
+        diff = target_vec - mean_vec
+        n = float(diff.norm())
+        self.steering_unit = diff / n if n > 1e-8 else diff.clone()
+
+    def update_targets_batched(self, units: torch.Tensor) -> None:
+        """units: (B, hidden_dim) precomputed unit vectors (target - mean) / ||·||.
+        Active rows are controlled by `set_moves_phase_mask`.
+        """
+        self.steering_units_batched = units
+
+    def set_moves_phase_mask(self, mask: torch.Tensor) -> None:
+        """mask: (B,) bool — True for rows that should receive the steering bump."""
+        self.moves_phase_mask = mask
 
     def activate_moves_phase(self) -> None:
         self.moves_phase_active = True
@@ -430,18 +434,28 @@ class SteeringHook:
         self.fired = 0
 
     def _hook(self, module, inputs, output):
-        if (not self.enabled
-                or not self.moves_phase_active
-                or self.target_vec is None):
+        if not self.enabled:
             return None
         h = output[0] if isinstance(output, tuple) else output
-        device, dtype = h.device, h.dtype
-        if self.mode == "directional":
-            sv = self.steering_unit.to(device=device, dtype=dtype)
-            h[:, -1:, :] = h[:, -1:, :] + self.scale * sv
-        else:
-            tv = self.target_vec.to(device=device, dtype=dtype)
-            h[:, -1:, :] = (1.0 - self.scale) * h[:, -1:, :] + self.scale * tv
+
+        # Batched path takes precedence when units have been registered.
+        if self.steering_units_batched is not None and self.moves_phase_mask is not None:
+            mask = self.moves_phase_mask.to(h.device)
+            if not mask.any():
+                return None
+            sv = self.steering_units_batched.to(device=h.device, dtype=h.dtype)
+            delta = self.alpha * sv * mask.to(dtype=h.dtype).unsqueeze(-1)  # (B, H)
+            h[:, -1:, :] = h[:, -1:, :] + delta.unsqueeze(1)
+            self.fired += int(mask.sum().item())
+            if isinstance(output, tuple):
+                return (h,) + output[1:]
+            return h
+
+        # Scalar / single-row path (legacy).
+        if (not self.moves_phase_active or self.steering_unit is None):
+            return None
+        sv = self.steering_unit.to(device=h.device, dtype=h.dtype)
+        h[:, -1:, :] = h[:, -1:, :] + self.alpha * sv
         self.fired += 1
         if isinstance(output, tuple):
             return (h,) + output[1:]
@@ -463,28 +477,6 @@ def build_prompt(tokenizer, state: State, idx: int, n_disks: int) -> str:
     return tokenizer.apply_chat_template(
         [{"role": "system", "content": sysp},
          {"role": "user", "content": userp}],
-        tokenize=False, add_generation_prompt=True,
-    )
-
-
-def build_oracle_step_prompt(tokenizer, current_pegs: List[List[int]],
-                             goal_pegs: List[List[int]], n_disks: int,
-                             moves_so_far: List[List[int]]) -> str:
-    sysp, userp, _ = create_nonstandard_prompt(
-        num_disks=n_disks, problem_id=0, seed=0,
-        initial_state_override=current_pegs, goal_state_override=goal_pegs,
-    )
-    moves_str = ", ".join(f"[{m[0]}, {m[1]}, {m[2]}]" for m in moves_so_far) if moves_so_far else "(none)"
-    addendum = (
-        f"\n\nMoves already executed: {moves_str}.\n"
-        f"Current peg configuration: peg 0={current_pegs[0]}, "
-        f"peg 1={current_pegs[1]}, peg 2={current_pegs[2]}.\n"
-        "Output ONLY the single next move toward the goal in the exact "
-        "format `moves = [[disk, from, to]]`. Do not output any other moves."
-    )
-    return tokenizer.apply_chat_template(
-        [{"role": "system", "content": sysp},
-         {"role": "user", "content": userp + addendum}],
         tokenize=False, add_generation_prompt=True,
     )
 
@@ -611,89 +603,175 @@ def generate_with_steering(
     return gen_text, current_state, n_legal_total, moves_phase_step
 
 
-def generate_plain(
-    raw_model: nn.Module,
-    tokenizer,
-    prompt_text: str,
-    max_new_tokens: int,
-    device: torch.device,
-    eos_ids: Set[int],
-) -> str:
-    """Vanilla greedy generation (no hooks)."""
-    enc = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
-    input_ids = enc["input_ids"].to(device)
-    generated_ids: List[int] = []
-    cur_input = input_ids
-    past = None
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            out = raw_model(input_ids=cur_input, past_key_values=past, use_cache=True)
-            past = out.past_key_values
-            next_id = int(out.logits[:, -1, :].argmax(dim=-1).item())
-            generated_ids.append(next_id)
-            if next_id in eos_ids:
-                break
-            cur_input = torch.tensor([[next_id]], device=device)
-    return tokenizer.decode(generated_ids, skip_special_tokens=False)
+def _compute_unit(target: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
+    diff = target - mean
+    n = float(diff.norm())
+    return diff / n if n > 1e-8 else diff.clone()
 
 
-def run_oracle_for_state(
+def generate_batched_with_steering(
     raw_model: nn.Module,
     tokenizer,
-    start_state: State,
+    prompt_texts: List[str],
+    start_states: List[State],
     n_disks: int,
-    max_oracle_steps: int,
+    layer_state_to_vec: Dict[int, Dict[State, torch.Tensor]],
+    layer_mean_vec: Dict[int, torch.Tensor],
+    hooks: Sequence[SteeringHook],
     max_new_tokens: int,
     device: torch.device,
     eos_ids: Set[int],
-) -> Tuple[str, List[List[int]], List[List[int]], str]:
-    """Iteratively ask the model for the next single move with the current state
-    in the prompt. Returns (concat_log, final_pegs, moves_executed, category).
+    decode_every: int = 1,
+    always_steer: bool = False,
+) -> List[Tuple[str, State, int, int]]:
+    """Batched analogue of `generate_with_steering`. All B problems decode in
+    lockstep with KV cache; the hook applies a per-row steering bump only to
+    rows whose moves-phase mask is on, using a per-row unit vector.
+
+    Returns a list of (gen_text, current_sim_state, n_legal, moves_phase_step)
+    in the same order as `prompt_texts`.
     """
-    goal_pegs = [[], [], list(range(n_disks, 0, -1))]
-    pegs = state_tuple_to_pegs(start_state, n_disks)
-    moves_executed: List[List[int]] = []
-    log_chunks: List[str] = []
-    category = WRONG_GOAL_STATE
+    B = len(prompt_texts)
+    if B == 0:
+        return []
 
-    for step in range(max_oracle_steps):
-        if pegs == goal_pegs:
-            category = (CORRECT_OPTIMAL
-                        if len(moves_executed) == optimal_length(start_state, n_disks)
-                        else CORRECT_SUBOPTIMAL)
-            break
-        prompt = build_oracle_step_prompt(tokenizer, pegs, goal_pegs, n_disks, moves_executed)
-        out_text = generate_plain(raw_model, tokenizer, prompt, max_new_tokens, device, eos_ids)
-        log_chunks.append(f"=== step {step} ===\n{out_text}\n")
+    # Left-pad so all prompts end at the same token offset → generation
+    # appends new tokens at position -1 for every row.
+    saved_padding_side = getattr(tokenizer, "padding_side", "right")
+    tokenizer.padding_side = "left"
+    try:
+        enc = tokenizer(
+            prompt_texts,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
+        )
+    finally:
+        tokenizer.padding_side = saved_padding_side
 
-        block = find_last_moves_block(out_text)
-        if block is None:
-            category = PARSE_ERROR
-            break
-        moves_in_block: List[Tuple[int, int, int]] = [
-            (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            for m in MOVE_RE.finditer(block[1])
-        ]
-        if not moves_in_block:
-            category = PARSE_ERROR
-            break
-        disk, src, dst = moves_in_block[0]
-        if (1 <= disk <= n_disks and 0 <= src <= 2 and 0 <= dst <= 2 and src != dst
-                and pegs[src] and pegs[src][-1] == disk
-                and (not pegs[dst] or pegs[dst][-1] > disk)):
-            pegs[dst].append(pegs[src].pop())
-            moves_executed.append([disk, src, dst])
-        else:
-            category = _illegal_category(disk, src, dst, n_disks, pegs)
-            break
-    else:
-        category = EXCESSIVE_MOVES
+    input_ids = enc["input_ids"].to(device)
+    attention_mask = enc["attention_mask"].to(device)
 
-    if pegs == goal_pegs and category not in CORRECT_CATEGORIES:
-        category = (CORRECT_OPTIMAL
-                    if len(moves_executed) == optimal_length(start_state, n_disks)
-                    else CORRECT_SUBOPTIMAL)
-    return "\n".join(log_chunks), pegs, moves_executed, category
+    start_pegs_list = [state_tuple_to_pegs(s, n_disks) for s in start_states]
+    current_states = [tuple(int(x) for x in s) for s in start_states]
+    moves_phase = [bool(always_steer)] * B
+    moves_phase_step = [-1] * B
+    finished = [False] * B
+    generated_ids_per_row: List[List[int]] = [[] for _ in range(B)]
+    n_legal_total = [0] * B
+
+    # Pre-fetch the (state -> unit-vector) cache per hook, then build the
+    # initial per-row unit tensor.
+    hook_state_units: Dict[int, Dict[State, torch.Tensor]] = {}
+    for h in hooks:
+        stv = layer_state_to_vec.get(h.layer_id)
+        mv = layer_mean_vec.get(h.layer_id)
+        if stv is None or mv is None:
+            continue
+        hook_state_units[h.layer_id] = {s: _compute_unit(v, mv) for s, v in stv.items()}
+
+    def _refresh_hook_units() -> None:
+        if not hooks:
+            return
+        for h in hooks:
+            units_map = hook_state_units.get(h.layer_id)
+            if units_map is None:
+                continue
+            rows = []
+            for s in current_states:
+                rows.append(units_map.get(s, torch.zeros_like(next(iter(units_map.values())))))
+            stacked = torch.stack(rows, dim=0)  # (B, H)
+            h.update_targets_batched(stacked)
+        mask = torch.tensor(moves_phase, dtype=torch.bool)
+        for h in hooks:
+            h.set_moves_phase_mask(mask)
+
+    _refresh_hook_units()
+    for h in hooks:
+        h.reset_moves_phase(active=False)  # we drive the mask explicitly per-row
+
+    cur_input = input_ids
+    cur_attn = attention_mask
+    past = None
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    with torch.no_grad():
+        for step in range(max_new_tokens):
+            if all(finished):
+                break
+            out = raw_model(
+                input_ids=cur_input,
+                attention_mask=cur_attn,
+                past_key_values=past,
+                use_cache=True,
+            )
+            past = out.past_key_values
+            next_logits = out.logits[:, -1, :]
+            next_ids = next_logits.argmax(dim=-1)  # (B,)
+
+            for b in range(B):
+                if finished[b]:
+                    continue
+                tok_id = int(next_ids[b].item())
+                generated_ids_per_row[b].append(tok_id)
+                if tok_id in eos_ids:
+                    finished[b] = True
+
+            # Substitute finished rows with pad so KV-cache stays aligned but
+            # outputs don't affect anything we read from them.
+            substituted = next_ids.clone()
+            for b in range(B):
+                if finished[b]:
+                    substituted[b] = pad_id
+            cur_input = substituted.unsqueeze(-1)  # (B, 1)
+            cur_attn = torch.cat(
+                [cur_attn, torch.ones((B, 1), device=device, dtype=cur_attn.dtype)],
+                dim=1,
+            )
+
+            # ── Per-row moves-phase detection + state tracking ───────────────
+            state_changed = False
+            phase_changed = False
+            for b in range(B):
+                if finished[b]:
+                    continue
+                ids_b = generated_ids_per_row[b]
+                if not moves_phase[b]:
+                    tail = tokenizer.decode(
+                        ids_b[-min(32, len(ids_b)):],
+                        skip_special_tokens=False,
+                    )
+                    if _MOVES_HEADER_RE.search(tail):
+                        moves_phase[b] = True
+                        moves_phase_step[b] = step
+                        phase_changed = True
+
+                if decode_every <= 1 or (step % decode_every == 0):
+                    tail = tokenizer.decode(
+                        ids_b[-min(8, len(ids_b)):],
+                        skip_special_tokens=False,
+                    )
+                    if ']' not in tail:
+                        continue
+                    full_text = tokenizer.decode(ids_b, skip_special_tokens=False)
+                    block = find_last_moves_block(full_text)
+                    if block is None:
+                        continue
+                    pegs, n_legal, _, _ = replay_block(block[1], start_pegs_list[b], n_disks)
+                    new_state = pegs_to_state(pegs, n_disks)
+                    if new_state != current_states[b]:
+                        current_states[b] = new_state
+                        n_legal_total[b] = n_legal
+                        state_changed = True
+
+            if hooks and (state_changed or phase_changed):
+                _refresh_hook_units()
+
+    out_rows: List[Tuple[str, State, int, int]] = []
+    for b in range(B):
+        gen_text = tokenizer.decode(generated_ids_per_row[b], skip_special_tokens=False)
+        out_rows.append((gen_text, current_states[b], n_legal_total[b], moves_phase_step[b]))
+    return out_rows
 
 
 # ── Sweep runner ───────────────────────────────────────────────────────────────
@@ -710,74 +788,93 @@ def run_condition(
     layer_ids: List[int],
     layer_state_to_vec: Dict[int, Dict[State, torch.Tensor]],
     layer_mean_vec: Dict[int, torch.Tensor],
-    mode: Optional[str],
-    scale: Optional[float],
+    alpha: Optional[float],
     max_new_tokens: int,
     device: torch.device,
     eos_ids: Set[int],
     decode_every: int,
     save_texts: bool,
     always_steer: bool = False,
+    batch_size: int = 1,
 ) -> Dict[str, object]:
-    """Run a single sweep cell. mode=None → no steering."""
+    """Run a single sweep cell. alpha=None → no steering.
+    `batch_size > 1` enables parallel multi-problem decoding via
+    `generate_batched_with_steering`.
+    """
     hooks: List[SteeringHook] = []
-    if mode is not None and scale is not None:
+    if alpha is not None:
         layers_list = get_layers_list(text_model)
         for lid in layer_ids:
             hooks.append(SteeringHook(
-                layers_list[lid - 1], lid, mode, float(scale),
+                layers_list[lid - 1], lid, float(alpha),
                 moves_phase_active=always_steer,
             ))
 
     per_problem: List[Dict[str, object]] = []
     cat_counter: Counter = Counter()
     t0 = time.time()
+    bs = max(1, batch_size)
     try:
-        for prob_idx, state in enumerate(states):
-            start_pegs = state_tuple_to_pegs(state, n_disks)
-            prompt = build_prompt(tokenizer, state, prob_idx, n_disks)
+        idx = 0
+        while idx < len(states):
+            chunk = states[idx: idx + bs]
+            prompts = [build_prompt(tokenizer, s, idx + j, n_disks)
+                       for j, s in enumerate(chunk)]
             try:
-                gen_text, sim_state, n_legal, moves_step = generate_with_steering(
-                    raw_model, tokenizer, prompt, state, n_disks,
-                    layer_state_to_vec, layer_mean_vec, hooks,
-                    max_new_tokens, device, eos_ids, decode_every,
-                    always_steer=always_steer,
-                )
+                if bs > 1:
+                    results = generate_batched_with_steering(
+                        raw_model, tokenizer, prompts, list(chunk), n_disks,
+                        layer_state_to_vec, layer_mean_vec, hooks,
+                        max_new_tokens, device, eos_ids, decode_every,
+                        always_steer=always_steer,
+                    )
+                else:
+                    g_text, g_state, g_legal, g_step = generate_with_steering(
+                        raw_model, tokenizer, prompts[0], chunk[0], n_disks,
+                        layer_state_to_vec, layer_mean_vec, hooks,
+                        max_new_tokens, device, eos_ids, decode_every,
+                        always_steer=always_steer,
+                    )
+                    results = [(g_text, g_state, g_legal, g_step)]
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    print(f"  [OOM on prob {prob_idx} state={state}; recovering]")
+                    print(f"  [OOM on batch starting at prob {idx} "
+                          f"(size {len(chunk)}); recovering]")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    gen_text = ""
-                    sim_state = state
-                    n_legal = 0
-                    moves_step = -1
+                    results = [("", s, 0, -1) for s in chunk]
                 else:
                     raise
 
-            cls = classify(gen_text, start_pegs, n_disks,
-                           opt_lens[state], goal_pegs)
-            cat_counter[cls["category"]] += 1
-            hook_fired = hooks[0].fired if hooks else 0
-            rec = {
-                "prob_idx": prob_idx,
-                "state": list(state),
-                **cls,
-                "sim_state": list(sim_state),
-                "n_legal_via_steering": n_legal,
-                "moves_phase_step": moves_step,
-                "hook_fired_steps": hook_fired,
-            }
-            if save_texts:
-                rec["generated_text"] = gen_text
-            per_problem.append(rec)
+            for j, ((gen_text, sim_state, n_legal, moves_step), state) in enumerate(
+                zip(results, chunk)
+            ):
+                prob_idx = idx + j
+                start_pegs = state_tuple_to_pegs(state, n_disks)
+                cls = classify(gen_text, start_pegs, n_disks,
+                               opt_lens[state], goal_pegs)
+                cat_counter[cls["category"]] += 1
+                hook_fired = hooks[0].fired if hooks else 0
+                rec = {
+                    "prob_idx": prob_idx,
+                    "state": list(state),
+                    **cls,
+                    "sim_state": list(sim_state),
+                    "n_legal_via_steering": n_legal,
+                    "moves_phase_step": moves_step,
+                    "hook_fired_steps": hook_fired,
+                }
+                if save_texts:
+                    rec["generated_text"] = gen_text
+                per_problem.append(rec)
 
-            print(f"    [{label}] {prob_idx+1:3d}/{len(states)}  state={state}  "
-                  f"cat={cls['category']:24s}  n_moves={cls['n_moves']:2d}  "
-                  f"opt={cls['opt_len']:2d}  legal_pref={cls['n_legal']}  "
-                  f"moves_at={moves_step}  hook_fired={hook_fired}  "
-                  f"sim={sim_state}")
+                print(f"    [{label}] {prob_idx+1:3d}/{len(states)}  state={state}  "
+                      f"cat={cls['category']:24s}  n_moves={cls['n_moves']:2d}  "
+                      f"opt={cls['opt_len']:2d}  legal_pref={cls['n_legal']}  "
+                      f"moves_at={moves_step}  hook_fired={hook_fired}  "
+                      f"sim={sim_state}")
 
+            idx += bs
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     finally:
@@ -786,65 +883,8 @@ def run_condition(
 
     return {
         "label": label,
-        "mode": mode,
-        "scale": scale,
+        "alpha": alpha,
         "layer_ids": layer_ids,
-        "category_counts": dict(cat_counter),
-        "n_solved": sum(cat_counter[c] for c in CORRECT_CATEGORIES),
-        "n_optimal": cat_counter.get(CORRECT_OPTIMAL, 0),
-        "n_illegal": sum(cat_counter[c] for c in ILLEGAL_CATEGORIES),
-        "n_parse_error": cat_counter.get(PARSE_ERROR, 0),
-        "runtime_seconds": time.time() - t0,
-        "per_problem": per_problem,
-    }
-
-
-def run_oracle_condition(
-    states: List[State],
-    raw_model: nn.Module,
-    tokenizer,
-    n_disks: int,
-    opt_lens: Dict[State, int],
-    args: argparse.Namespace,
-    device: torch.device,
-    eos_ids: Set[int],
-) -> Dict[str, object]:
-    cat_counter: Counter = Counter()
-    per_problem: List[Dict[str, object]] = []
-    t0 = time.time()
-    for prob_idx, state in enumerate(states):
-        try:
-            log, final_pegs, moves, cat = run_oracle_for_state(
-                raw_model, tokenizer, state, n_disks,
-                args.max_oracle_steps, args.oracle_max_new_tokens,
-                device, eos_ids,
-            )
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print(f"  [oracle OOM at prob {prob_idx} state={state}]")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                continue
-            raise
-        cat_counter[cat] += 1
-        rec = {
-            "prob_idx": prob_idx,
-            "state": list(state),
-            "category": cat,
-            "n_moves": len(moves),
-            "opt_len": opt_lens[state],
-            "final_pegs": final_pegs,
-        }
-        if args.save_texts:
-            rec["log"] = log
-        per_problem.append(rec)
-        print(f"    [oracle] {prob_idx+1:3d}/{len(states)}  state={state}  cat={cat:24s}  "
-              f"moves={len(moves):2d}  opt={opt_lens[state]:2d}")
-    return {
-        "label": "oracle",
-        "mode": "oracle",
-        "scale": None,
-        "layer_ids": [],
         "category_counts": dict(cat_counter),
         "n_solved": sum(cat_counter[c] for c in CORRECT_CATEGORIES),
         "n_optimal": cat_counter.get(CORRECT_OPTIMAL, 0),
@@ -861,17 +901,17 @@ def print_comparison_table(results: List[Dict[str, object]], n_states: int) -> N
     print("\n" + "=" * 96)
     print("COMPARISON TABLE")
     print("=" * 96)
-    hdr = (f"{'Condition':<28} {'Layers':>10} {'α/β':>8} "
+    hdr = (f"{'Condition':<28} {'Layers':>10} {'α':>8} "
            f"{'Solved':>8} {'Optimal':>8} {'Illegal':>8} {'Parse':>7} {'Wrong':>7}")
     print(hdr)
     print("-" * 96)
     for r in results:
-        scale_str = f"{r['scale']:.3f}" if isinstance(r["scale"], (int, float)) else "  -"
+        alpha_str = f"{r['alpha']:.3f}" if isinstance(r["alpha"], (int, float)) else "  -"
         layers_str = ",".join(str(l) for l in r["layer_ids"]) if r["layer_ids"] else "-"
         cc = r["category_counts"]
         wrong = (cc.get(WRONG_GOAL_STATE, 0) + cc.get(PREMATURE_STOP, 0)
                  + cc.get(EXCESSIVE_MOVES, 0))
-        print(f"{r['label']:<28} {layers_str:>10} {scale_str:>8} "
+        print(f"{r['label']:<28} {layers_str:>10} {alpha_str:>8} "
               f"{r['n_solved']:>4d}/{n_states:<3d}  "
               f"{r['n_optimal']:>4d}/{n_states:<3d} "
               f"{r['n_illegal']:>4d}/{n_states:<3d} "
@@ -986,6 +1026,10 @@ def main() -> None:
         raise RuntimeError(f"Expected 81 states, got {len(states_all)}")
 
     # Optionally drop the problems the model already solves (per eval results).
+    # Accepts two schemas:
+    #   Qwen-style: {records: [{state_tuple, category, ...}]} where success means
+    #               category in CORRECT_CATEGORIES.
+    #   DeepSeek-style: list of {state_tuple, passed, ...} where success is passed=True.
     skipped_solved: Set[State] = set()
     if args.failed_only:
         eval_path = Path(args.eval_results)
@@ -994,9 +1038,18 @@ def main() -> None:
                 f"--failed_only needs {eval_path}; run evaluate_model.py first")
         with open(eval_path) as f:
             eval_data = json.load(f)
-        for r in eval_data.get("records", []):
-            if r["category"] in CORRECT_CATEGORIES:
-                skipped_solved.add(tuple(int(x) for x in r["state_tuple"]))
+        if isinstance(eval_data, dict) and "records" in eval_data:
+            for r in eval_data["records"]:
+                if r.get("category") in CORRECT_CATEGORIES:
+                    skipped_solved.add(tuple(int(x) for x in r["state_tuple"]))
+        elif isinstance(eval_data, list):
+            for r in eval_data:
+                if r.get("passed"):
+                    st = r.get("state_tuple") or r.get("state")
+                    if st is not None:
+                        skipped_solved.add(tuple(int(x) for x in st))
+        else:
+            raise ValueError(f"Unrecognized schema in {eval_path}")
         before = len(states_all)
         states_all_for_run = [s for s in states_all if s not in skipped_solved]
         print(f"[INFO] --failed_only: dropped {before - len(states_all_for_run)} "
@@ -1039,9 +1092,7 @@ def main() -> None:
     print(f"[INFO] num_hidden_layers={int(cfg.num_hidden_layers)}  "
           f"hidden_size={int(cfg.hidden_size)}")
 
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     alphas = [float(x) for x in args.alphas.split(",") if x.strip()]
-    betas = [float(x) for x in args.betas.split(",") if x.strip()]
 
     results: List[Dict[str, object]] = []
     baseline_result: Optional[Dict[str, object]] = None
@@ -1055,42 +1106,33 @@ def main() -> None:
             goal_pegs=goal_pegs, layer_ids=[],
             layer_state_to_vec=layer_state_to_vec,
             layer_mean_vec=layer_mean_vec,
-            mode=None, scale=None,
+            alpha=None,
             max_new_tokens=args.max_new_tokens, device=device,
             eos_ids=eos_ids, decode_every=args.decode_every,
             save_texts=args.save_texts,
             always_steer=args.always_steer,
+            batch_size=args.batch_size,
         )
         results.append(baseline_result)
 
-    for mode in modes:
-        scales = alphas if mode == "directional" else betas
-        for scale in scales:
-            tag = f"{mode}_{scale}_L{'-'.join(str(l) for l in layer_ids)}"
-            print(f"\n[INFO] === Condition: {tag} ===")
-            r = run_condition(
-                label=tag,
-                states=states, raw_model=raw_model, text_model=text_model,
-                tokenizer=tokenizer, n_disks=n_disks, opt_lens=opt_lens,
-                goal_pegs=goal_pegs, layer_ids=layer_ids,
-                layer_state_to_vec=layer_state_to_vec,
-                layer_mean_vec=layer_mean_vec,
-                mode=mode, scale=scale,
-                max_new_tokens=args.max_new_tokens, device=device,
-                eos_ids=eos_ids, decode_every=args.decode_every,
-                save_texts=args.save_texts,
-                always_steer=args.always_steer,
-            )
-            results.append(r)
-
-    if args.run_oracle:
-        print("\n[INFO] === Condition: oracle (state in prompt) ===")
-        oracle_result = run_oracle_condition(
-            states=states, raw_model=raw_model, tokenizer=tokenizer,
-            n_disks=n_disks, opt_lens=opt_lens, args=args,
-            device=device, eos_ids=eos_ids,
+    for alpha in alphas:
+        tag = f"directional_{alpha}_L{'-'.join(str(l) for l in layer_ids)}"
+        print(f"\n[INFO] === Condition: {tag} ===")
+        r = run_condition(
+            label=tag,
+            states=states, raw_model=raw_model, text_model=text_model,
+            tokenizer=tokenizer, n_disks=n_disks, opt_lens=opt_lens,
+            goal_pegs=goal_pegs, layer_ids=layer_ids,
+            layer_state_to_vec=layer_state_to_vec,
+            layer_mean_vec=layer_mean_vec,
+            alpha=alpha,
+            max_new_tokens=args.max_new_tokens, device=device,
+            eos_ids=eos_ids, decode_every=args.decode_every,
+            save_texts=args.save_texts,
+            always_steer=args.always_steer,
+            batch_size=args.batch_size,
         )
-        results.append(oracle_result)
+        results.append(r)
 
     print_comparison_table(results, n_states)
 
@@ -1100,9 +1142,7 @@ def main() -> None:
         "n_disks": n_disks,
         "n_problems": n_states,
         "layer_ids": layer_ids,
-        "modes": modes,
         "alphas": alphas,
-        "betas": betas,
         "max_new_tokens": args.max_new_tokens,
         "results": [
             {k: v for k, v in r.items()
@@ -1124,7 +1164,7 @@ def main() -> None:
     # pre-known solved set in as `known_solved` to keep the plot honest.
     coords = load_probe_coords(Path(args.probe_dir), args.layer, states_all)
     if coords is not None:
-        scored = [r for r in results if r["label"] != "baseline" and r["label"] != "oracle"]
+        scored = [r for r in results if r["label"] != "baseline"]
         if scored and (baseline_result is not None or skipped_solved):
             best = max(scored, key=lambda r: r["n_solved"])
             base_n = (baseline_result["n_solved"] if baseline_result is not None
