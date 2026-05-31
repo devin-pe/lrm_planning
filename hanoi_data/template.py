@@ -145,7 +145,7 @@ def generate_trace(
 
     Supervisions are character spans of the state literals inside the
     'State: {before} -> {after}.' lines only — not the framing 'Starting
-    from …' line and not the final 'Solution:' block.
+    from …' line and not the final 'moves = [...]' block.
     """
     s_I_t = tuple(int(x) for x in s_I)
     s_G_t = tuple(int(x) for x in s_G)
@@ -221,7 +221,7 @@ def generate_trace(
         )
 
     append("All disks are in their goal positions.\n</think>\n\n")
-    append(f"Solution: {[list(m) for m in moves]}\n")
+    append(f"moves = {[list(m) for m in moves]}\n")
 
     completion = "".join(completion_parts)
 

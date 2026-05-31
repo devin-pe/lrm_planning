@@ -384,9 +384,20 @@ def spearman_dist_vs_graph(
     graph_dist: np.ndarray,
     valid_mask: np.ndarray,
 ) -> float:
+    rho, _ = corr_dist_vs_graph(act_dist, graph_dist, valid_mask)
+    return rho
+
+
+def corr_dist_vs_graph(
+    act_dist: np.ndarray,
+    graph_dist: np.ndarray,
+    valid_mask: np.ndarray,
+) -> Tuple[float, float]:
+    """Return (spearman_rho, pearson_r) on the upper-triangular pairs over
+    the valid-mask sub-matrix."""
     idx = np.where(valid_mask)[0]
     if idx.size < 3:
-        return float("nan")
+        return float("nan"), float("nan")
 
     d_act = act_dist[np.ix_(idx, idx)]
     d_graph = graph_dist[np.ix_(idx, idx)]
@@ -397,10 +408,17 @@ def spearman_dist_vs_graph(
 
     finite = np.isfinite(a) & np.isfinite(g)
     if np.sum(finite) < 3:
-        return float("nan")
+        return float("nan"), float("nan")
 
-    rho, _ = spearmanr(a[finite], g[finite])
-    return float(rho)
+    af = a[finite].astype(np.float64)
+    gf = g[finite].astype(np.float64)
+    rho, _ = spearmanr(af, gf)
+    rho = float(rho) if np.isfinite(rho) else float("nan")
+    ac = af - af.mean()
+    gc = gf - gf.mean()
+    denom = float(np.sqrt(np.sum(ac * ac) * np.sum(gc * gc)))
+    pearson = float(np.sum(ac * gc) / denom) if denom > 0 else float("nan")
+    return rho, pearson
 
 
 def fit_disk_probes_and_weights(x: np.ndarray, states_or_labels: np.ndarray) -> Tuple[List[float], List[np.ndarray]]:
@@ -466,12 +484,15 @@ def build_accuracy_table(sep_acc: Sequence[float], move_acc: Sequence[float]) ->
     return "\n".join(lines) + "\n"
 
 
-def build_spearman_table(sep_rho: float, move_rho: float) -> str:
+def build_spearman_table(sep_rho: float, move_rho: float,
+                         sep_pearson: float = float("nan"),
+                         move_pearson: float = float("nan")) -> str:
+    """Activation-vs-graph distance correlation table (Spearman + Pearson)."""
     lines = []
-    lines.append("Position    | Spearman rho (activation dist vs graph dist)")
-    lines.append("------------+---------------------------------------------")
-    lines.append(f"SEP         | {sep_rho:.4f}")
-    lines.append(f"Move tokens | {move_rho:.4f}")
+    lines.append("Position    | Spearman rho |  Pearson r   (activation dist vs graph dist)")
+    lines.append("------------+--------------+-----------------------------------------------")
+    lines.append(f"SEP         | {sep_rho:12.4f} | {sep_pearson:10.4f}")
+    lines.append(f"Move tokens | {move_rho:12.4f} | {move_pearson:10.4f}")
     return "\n".join(lines) + "\n"
 
 
@@ -615,10 +636,10 @@ def main() -> None:
     sep_euc = euclidean_distance_matrix(x_sep, sep_valid)
     move_euc = euclidean_distance_matrix(move_avg, move_valid)
 
-    sep_rho = spearman_dist_vs_graph(sep_euc, graph_dist, sep_valid)
-    move_rho = spearman_dist_vs_graph(move_euc, graph_dist, move_valid)
+    sep_rho, sep_pearson = corr_dist_vs_graph(sep_euc, graph_dist, sep_valid)
+    move_rho, move_pearson = corr_dist_vs_graph(move_euc, graph_dist, move_valid)
 
-    spearman_table = build_spearman_table(sep_rho, move_rho)
+    spearman_table = build_spearman_table(sep_rho, move_rho, sep_pearson, move_pearson)
     print(spearman_table)
 
     # Part 4: subspace orthogonality.
@@ -674,6 +695,8 @@ def main() -> None:
         "distance_structure": {
             "spearman_sep": float(sep_rho),
             "spearman_move_tokens": float(move_rho),
+            "pearson_sep": float(sep_pearson),
+            "pearson_move_tokens": float(move_pearson),
         },
         "subspace_angles_deg": {
             "sep": sep_angles.tolist(),

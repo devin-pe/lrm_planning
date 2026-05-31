@@ -868,24 +868,27 @@ def main() -> None:
             text_rotation_deg_clockwise=0.0,
         )
 
-    print("\nProbe       | Layer | Nearest-State Acc | Spearman rho | Early Acc | Mid Acc | Late Acc | Val Loss")
-    print("------------+-------+-------------------+--------------+-----------+---------+----------+---------")
+    print("\nProbe       | Layer | Nearest-State Acc | Spearman rho |  Pearson r | Early Acc | Mid Acc | Late Acc | Val Loss")
+    print("------------+-------+-------------------+--------------+------------+-----------+---------+----------+---------")
     order = {"small_mlp": 0, "large_mlp": 1}
     rows_sorted = sorted(results_rows, key=lambda r: (order[str(r["probe_key"])], int(r["layer"])))
     for r in rows_sorted:
+        pearson = float(r.get("pearson_r", float("nan")))
         print(
             f"{str(r['probe_name']):11s} | {int(r['layer']):5d} | {pct(float(r['nearest_state_acc'])):>17} | "
-            f"{float(r['spearman_rho']):12.4f} | {pct(float(r['early_acc'])):>9} | {pct(float(r['mid_acc'])):>7} | "
+            f"{float(r['spearman_rho']):12.4f} | {pearson:10.4f} | "
+            f"{pct(float(r['early_acc'])):>9} | {pct(float(r['mid_acc'])):>7} | "
             f"{pct(float(r['late_acc'])):>8} | {float(r['val_loss']):7.4f}"
         )
 
-    print("\nProbe       | Best Layer | Nearest-State Acc | Spearman rho")
-    print("------------+------------+-------------------+--------------")
+    print("\nProbe       | Best Layer | Nearest-State Acc | Spearman rho |  Pearson r")
+    print("------------+------------+-------------------+--------------+------------")
     for probe_key in ["small_mlp", "large_mlp"]:
         r = best_by_probe[probe_key]
+        pearson = float(r.get("pearson_r", float("nan")))
         print(
             f"{str(r['probe_name']):11s} | {int(r['layer']):10d} | {pct(float(r['nearest_state_acc'])):>17} | "
-            f"{float(r['spearman_rho']):12.4f}"
+            f"{float(r['spearman_rho']):12.4f} | {pearson:10.4f}"
         )
 
     if best_global is None:

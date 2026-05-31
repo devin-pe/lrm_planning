@@ -31,40 +31,49 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from compute_pearson_qwen_generation import build_distances  # noqa: E402
 from eval.solve import build_prompt  # noqa: E402
-from finetune.utils import (  # noqa: E402
-    N_STATES,
-    normalised_graph_distance_matrix,
-    state_to_idx,
-)
+from finetune.utils import state_to_idx  # noqa: E402
 
 State = Tuple[int, ...]
 
 
-_MOVE_LINE = re.compile(r"\bMove\s+(\d+)\s*:")
-_SOLUTION_HEADER = re.compile(r"Solution\s*:", re.IGNORECASE)
+# The opener of the move list the prompt asks for: "moves = ["
+_MOVES_HEADER = re.compile(r"\bmoves\s*=\s*\[", re.IGNORECASE)
+# A single move triple inside that list: [disk, from, to] (1-indexed disk).
+_MOVE_TRIPLE = re.compile(r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]")
 
 
 # ── Hidden-state collection ───────────────────────────────────────────────────
 
 def _state_after_k_moves(s_I: State, moves: Sequence[Sequence[int]], k: int) -> State:
-    """Apply the first `k` 2-tuple moves against s_I (1-indexed disks internally)."""
-    from hanoi_data.template import N_DISKS, state_to_pegs
+    """Apply the first `k` [disk, from, to] moves against s_I. Disk is
+    1-indexed (matches the prompt's `moves = [[disk, from, to], …]` format).
+    Falls back gracefully for 2-tuple moves (`[from, to]`) by inferring the
+    topmost source-peg disk.
+    """
+    from hanoi_data.template import state_to_pegs
+    n_disks = len(s_I)
     pegs = [list(p) for p in state_to_pegs(tuple(int(x) for x in s_I))]
     for i in range(min(k, len(moves))):
         m = moves[i]
-        if not (isinstance(m, list) and len(m) == 2):
+        if not isinstance(m, list):
             break
-        fp, tp = int(m[0]), int(m[1])
+        if len(m) == 3:
+            declared, fp, tp = int(m[0]), int(m[1]), int(m[2])
+        elif len(m) == 2:
+            declared, fp, tp = None, int(m[0]), int(m[1])
+        else:
+            break
         if not (0 <= fp <= 2 and 0 <= tp <= 2) or not pegs[fp]:
             break
         disk = pegs[fp][-1]
+        if declared is not None and declared != disk:
+            break
         if pegs[tp] and pegs[tp][-1] < disk:
             break
         pegs[fp].pop()
         pegs[tp].append(disk)
-    out = [0] * N_DISKS
+    out = [0] * n_disks
     for p, peg_list in enumerate(pegs):
         for d in peg_list:
             out[d - 1] = p
@@ -72,27 +81,55 @@ def _state_after_k_moves(s_I: State, moves: Sequence[Sequence[int]], k: int) -> 
 
 
 def _emitted_moves_from_text(text: str) -> List[List[int]]:
-    """Extract intra-think emitted moves like 'moving to peg T' — but the cleanest
-    signal is the final 'Solution: [[…]]' block which the template always emits.
-    We use that as ground-truth for what the model actually committed to.
+    """The final `moves = [...]` block the template always emits. Returns the
+    committed sequence as list of [disk, from, to] triples.
     """
     from planning import _extract_moves_block, _parse_moves_json
-    m = _SOLUTION_HEADER.search(text)
-    if m is None:
-        return []
-    after = text[m.end():]
-    block = _extract_moves_block("moves = " + after)
+    block = _extract_moves_block(text)
     if block is None:
         return []
     try:
         moves = _parse_moves_json(block)
-        return [[int(x) for x in mv] for mv in moves if len(mv) == 2]
+        return [[int(x) for x in mv] for mv in moves if len(mv) == 3]
     except Exception:
         return []
 
 
 def _model_input_device(model) -> torch.device:
     return model.get_input_embeddings().weight.device
+
+
+def _user_end_tok(tokenizer, sys_p: str, user_p: str) -> Optional[int]:
+    """Token index (in the FULL chat-templated prompt) of the last token whose
+    character span ends at or after the final char of `user_p`.
+
+    Rationale: the chat template wraps user_p in something like
+    `<|im_start|>user\n…user_p…<|im_end|>\n<|im_start|>assistant\n`. The last
+    raw prompt token (`prompt_tok_len - 1`) would be the trailing `\n` of the
+    assistant header. We want the period at the end of "…into the goal
+    configuration." — i.e. the last token *of the actual user content*,
+    before the chat-template tail.
+    """
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "system", "content": sys_p},
+         {"role": "user", "content": user_p}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    user_p_end_char = prompt.rfind(user_p)
+    if user_p_end_char < 0:
+        return None
+    user_p_end_char += len(user_p) - 1  # index of the final char of user_p
+    enc = tokenizer(prompt, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc["offset_mapping"]
+    last = None
+    for i, (s, e) in enumerate(offsets):
+        if s == e:
+            continue
+        if s <= user_p_end_char < e:
+            return i
+        if s <= user_p_end_char:
+            last = i
+    return last
 
 
 @torch.no_grad()
@@ -232,53 +269,97 @@ def _extract_positions(
     comp_offsets: List[Tuple[int, int]],
     prompt_len_tokens: int,
     layer_hidden: torch.Tensor,
+    user_end_tok: Optional[int] = None,
 ) -> Tuple[Optional[torch.Tensor],
            List[Tuple[torch.Tensor, State]],
            List[Tuple[torch.Tensor, State]]]:
-    """Pull layer-K hidden vectors at Positions A / B / C.
+    """Layer-K hidden vectors at Positions A / B / C, matching the canonical
+    LRM probing convention (probe_qwen_generation.py) with one refinement:
 
-    Returns (h_A, [(h_B, target_state)], [(h_C, target_state), …]). Any of
-    these may be None / [] when the relevant landmark isn't found.
+      A : last token of the actual USER PROMPT CONTENT (the `.` of
+          "…into the goal configuration."), not the last token of the full
+          chat-templated prompt. Falls back to `prompt_len_tokens - 1` if
+          `user_end_tok` isn't supplied.
+      B : token immediately before the `[` that opens the LAST `moves = [...]`
+          block (the model has just committed to outputting a move list and
+          is about to emit the opener). Target state = s_I (nothing has been
+          committed yet in token-space).
+      C : token at the closing `]` of each `[disk, from, to]` move triple
+          inside that last `moves = [...]` block. Target state = state AFTER
+          that move is applied (the residual stream at the `]` should encode
+          the post-move configuration). Only legal moves contribute.
     """
-    # Position A: last prompt token.
-    h_A = layer_hidden[prompt_len_tokens - 1].clone()
+    # Position A.
+    a_idx = user_end_tok if user_end_tok is not None else (prompt_len_tokens - 1)
+    if a_idx is None or not (0 <= a_idx < layer_hidden.shape[0]):
+        h_A = None
+    else:
+        h_A = layer_hidden[a_idx].clone()
 
-    # Position B: token just before "Solution:".
+    # Position B: token before the OUTER `[` of the final `moves = [` block.
     h_B_list: List[Tuple[torch.Tensor, State]] = []
-    sol_match = _SOLUTION_HEADER.search(gen_text)
-    if sol_match is not None:
-        tok_idx = _char_to_token(comp_offsets, sol_match.start())
+    last_b_open: Optional[int] = None
+    for m in _MOVES_HEADER.finditer(gen_text):
+        last_b_open = m.end() - 1  # char position of `[` itself
+    if last_b_open is not None:
+        tok_idx = _char_to_token(comp_offsets, last_b_open)
         if tok_idx is not None and tok_idx >= 1:
-            # token-just-before is index (tok_idx - 1) in completion; in full seq
-            # add prompt_len_tokens.
             full_idx = prompt_len_tokens + (tok_idx - 1)
             if 0 <= full_idx < layer_hidden.shape[0]:
-                # State at Position B is the final s_G (model has done all its
-                # internal reasoning and is about to emit the final move list).
-                # We use s_G_t = s_I (model hasn't moved anything) as the
-                # "starting" state? No — the model has committed mental moves
-                # in CoT. Use the model's predicted final state derived from
-                # its emitted Solution moves; if extraction fails, fall back to
-                # s_I.
-                emitted = _emitted_moves_from_text(gen_text)
-                target = _state_after_k_moves(s_I, emitted, len(emitted)) if emitted else tuple(s_I)
-                h_B_list.append((layer_hidden[full_idx].clone(), target))
+                h_B_list.append((layer_hidden[full_idx].clone(), tuple(s_I)))
 
-    # Position C: token just before each "Move N:" header.
+    # Position C: for the LAST `moves = [...]` block, walk each [d,f,t]
+    # triple in order, simulate it against the running board, and on success
+    # record (closing `]` token index, state-after-move).
     h_C_list: List[Tuple[torch.Tensor, State]] = []
-    emitted = _emitted_moves_from_text(gen_text)
-    for m in _MOVE_LINE.finditer(gen_text):
-        n_move = int(m.group(1))
-        tok_idx = _char_to_token(comp_offsets, m.start())
-        if tok_idx is None or tok_idx < 1:
+    block_start_char: Optional[int] = None
+    block_end_char: Optional[int] = None
+    for m in _MOVES_HEADER.finditer(gen_text):
+        bracket_start = gen_text.find("[", m.start())
+        if bracket_start < 0:
             continue
-        full_idx = prompt_len_tokens + (tok_idx - 1)
-        if not (0 <= full_idx < layer_hidden.shape[0]):
-            continue
-        # The model is about to emit move N (1-indexed). The relevant true
-        # state is the one BEFORE move N is applied, i.e. after (N-1) moves.
-        true_state = _state_after_k_moves(s_I, emitted, n_move - 1)
-        h_C_list.append((layer_hidden[full_idx].clone(), true_state))
+        depth = 0
+        for idx in range(bracket_start, len(gen_text)):
+            c = gen_text[idx]
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    candidate = gen_text[bracket_start:idx + 1]
+                    if candidate != "[]":
+                        block_start_char = bracket_start
+                        block_end_char = idx + 1
+                    break
+    if block_start_char is not None and block_end_char is not None:
+        block_text = gen_text[block_start_char:block_end_char]
+        from hanoi_data.template import state_to_pegs
+        n_disks = len(s_I)
+        pegs = [list(p) for p in state_to_pegs(tuple(int(x) for x in s_I))]
+        for mv in _MOVE_TRIPLE.finditer(block_text):
+            disk = int(mv.group(1)); fp = int(mv.group(2)); tp = int(mv.group(3))
+            # Legality check + apply.
+            if not (1 <= disk <= n_disks and 0 <= fp <= 2 and 0 <= tp <= 2):
+                break
+            if not pegs[fp] or pegs[fp][-1] != disk:
+                break
+            if pegs[tp] and pegs[tp][-1] < disk:
+                break
+            pegs[tp].append(pegs[fp].pop())
+            # closing `]` of this triple, in gen_text coords
+            close_char_in_gen = block_start_char + (mv.end() - 1)
+            tok_idx = _char_to_token(comp_offsets, close_char_in_gen)
+            if tok_idx is None:
+                continue
+            full_idx = prompt_len_tokens + tok_idx
+            if not (0 <= full_idx < layer_hidden.shape[0]):
+                continue
+            # state-after-move as a spec tuple
+            out = [0] * n_disks
+            for p, peg_list in enumerate(pegs):
+                for d in peg_list:
+                    out[d - 1] = p
+            h_C_list.append((layer_hidden[full_idx].clone(), tuple(out)))
 
     return h_A, h_B_list, h_C_list
 
@@ -344,16 +425,19 @@ def run_probe_eval(
     test_rows: List[Dict],
     max_new_tokens: int,
     out_dir: Path,
-    sample_n: int = 81,
+    sample_n: Optional[int] = None,
     batch_size: int = 8,
+    n_disks: int = 4,
 ) -> Dict:
     """Collect hidden states across `sample_n` problems × per-layer, then train
     fresh per-layer probes and optionally apply the loaded probe head.
 
-    `sample_n` defaults to 81 (one per s_I) which gives the cleanest probe
+    `sample_n` defaults to 3**n_disks (one per s_I) which gives the cleanest probe
     fits; raise to use more problems if desired.
     """
-    # Stratify by s_I so we cover all 81 starts.
+    if sample_n is None:
+        sample_n = 3 ** n_disks
+    # Stratify by s_I so we cover all distinct starts.
     by_start: Dict[Tuple, List[Dict]] = defaultdict(list)
     for r in test_rows:
         by_start[tuple(r["s_I"])].append(r)
@@ -368,7 +452,7 @@ def run_probe_eval(
                 break
     chosen = chosen[:sample_n]
     print(f"[probe_eval] collecting hidden states on {len(chosen)} problems "
-          f"(layers={list(probe_layers)})")
+          f"(layers={list(probe_layers)}, n_disks={n_disks})")
 
     # layer -> position -> list of (hidden_vec, state)
     bucket: Dict[int, Dict[str, List[Tuple[torch.Tensor, State]]]] = {
@@ -377,9 +461,16 @@ def run_probe_eval(
 
     bs = max(1, batch_size)
     i = 0
+    from hanoi_data.template import get_prompts  # local to avoid cycles
     while i < len(chosen):
         chunk = chosen[i: i + bs]
         prompts = [build_prompt(tokenizer, tuple(r["s_I"]), tuple(r["s_G"])) for r in chunk]
+        # Position-A anchor: last token of the user-content text, computed
+        # per-row from the same (sys, user) prompts.
+        user_end_toks: List[Optional[int]] = []
+        for r in chunk:
+            sys_p, user_p = get_prompts(tuple(r["s_I"]), tuple(r["s_G"]))
+            user_end_toks.append(_user_end_tok(tokenizer, sys_p, user_p))
         gen_texts, comp_offs, layer_h_list, prompt_lens = _generate_then_forward_batched(
             model, tokenizer, prompts, max_new_tokens, probe_layers,
         )
@@ -388,7 +479,8 @@ def run_probe_eval(
             s_G = tuple(row["s_G"])
             for L in probe_layers:
                 h_A, h_B_list, h_C_list = _extract_positions(
-                    s_I, s_G, gen_texts[j], comp_offs[j], prompt_lens[j], layer_h_list[j][L],
+                    s_I, s_G, gen_texts[j], comp_offs[j], prompt_lens[j],
+                    layer_h_list[j][L], user_end_tok=user_end_toks[j],
                 )
                 if h_A is not None:
                     bucket[L]["A"].append((h_A, s_I))
@@ -397,18 +489,13 @@ def run_probe_eval(
         i += bs
         print(f"  [probe_eval] {min(i, len(chosen)):4d}/{len(chosen)}")
 
-    # graph-distance for the probe target
-    norm_dist = normalised_graph_distance_matrix().numpy()
-    raw_dist = (norm_dist * (norm_dist[~np.eye(N_STATES, dtype=bool)].std() or 1.0))
-    # We need the per-bucket sub-matrix; build it from the same scale used at training.
-    norm_factor = (raw_dist[~np.eye(N_STATES, dtype=bool)].std() or 1.0)
-
-    nbrs = build_distances(  # reuse to get the adjacency dict for AdjAcc
-        [tuple(int(x) for x in r["s_I"]) for r in test_rows[:1]], 4
-    )[1]  # build_distances expects a state list, but its nbrs depend only on n_disks.
-    # Cleaner: build directly from finetune.utils adjacency.
-    from finetune.utils import build_graph_adjacency
-    adj = build_graph_adjacency()
+    # Full 3^n-state adjacency + raw distance matrix sized for this run's n_disks.
+    from finetune.utils import (
+        build_graph_adjacency,
+        graph_distance_matrix as _gdm,
+    )
+    adj = build_graph_adjacency(n_disks=n_disks)
+    raw_dist_run = _gdm(n_disks=n_disks).numpy()
 
     fresh_results: Dict[str, Dict] = {}
     trained_head_results: Dict[str, Dict] = {}
@@ -435,7 +522,7 @@ def run_probe_eval(
                 continue
             x, states = _bucket_states_with_avg(items)
             sub_dist = np.array([
-                [float(adj_path_len(adj, a, b)) for b in states]
+                [float(raw_dist_run[state_to_idx(a), state_to_idx(b)]) for b in states]
                 for a in states
             ], dtype=np.float64)
             sub_norm = sub_dist / max(sub_dist[sub_dist > 0].std(), 1e-8)
@@ -477,13 +564,3 @@ def run_probe_eval(
     return out
 
 
-def adj_path_len(adj: Dict[State, List[State]], a: State, b: State) -> int:
-    """BFS path length from a to b in the adjacency graph (cached via finetune.utils)."""
-    # We re-derive via normalised matrix to avoid an extra BFS implementation.
-    # Use raw distance matrix (one-time build, cached as module-level singleton).
-    return _RAW_DIST[state_to_idx(a), state_to_idx(b)]
-
-
-# module-level cached raw distance matrix
-from finetune.utils import graph_distance_matrix as _gdm
-_RAW_DIST = _gdm().numpy()

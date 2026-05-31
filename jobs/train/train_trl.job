@@ -1,0 +1,88 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100          # Partition name
+#SBATCH --gres=gpu:2                  # Number of GPUs: training + vLLM
+#SBATCH --mem=150G
+#SBATCH --cpus-per-task=12            # Number of CPU cores per task
+#SBATCH --job-name=train_trl          # Job name
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=8:00:00                # Time limit
+#SBATCH --output=/home/dpereira/lrm_planning/work/train_trl_%A.out
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd $REPO_ROOT
+
+# Set all cache directories to scratch to avoid disk quota issues
+export SCRATCH_DIR=/scratch-shared/dpereira
+mkdir -p $SCRATCH_DIR
+
+# HuggingFace cache
+export HF_HOME=$SCRATCH_DIR/hf_cache
+export TRANSFORMERS_CACHE=$SCRATCH_DIR/transformers
+export HF_DATASETS_CACHE=$SCRATCH_DIR/datasets
+mkdir -p $HF_HOME $TRANSFORMERS_CACHE $HF_DATASETS_CACHE
+
+# PyTorch/Triton compilation caches
+export TORCH_HOME=$SCRATCH_DIR/torch_cache
+export TRITON_CACHE_DIR=$SCRATCH_DIR/triton_cache
+mkdir -p $TORCH_HOME $TRITON_CACHE_DIR
+
+# General XDG cache
+export XDG_CACHE_HOME=$SCRATCH_DIR/cache
+mkdir -p $XDG_CACHE_HOME
+
+# Check if TRL is installed, install if not
+python -c "import trl" 2>/dev/null || pip install trl>=0.15.0
+
+# Start vLLM server in background on GPU 1 for TRL
+echo "Starting vLLM server on GPU 1..."
+CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.openai.api_server \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --trust-remote-code \
+  --dtype bfloat16 \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.85 \
+  --port 8000 \
+  --host 0.0.0.0 \
+  --download-dir /scratch-shared/dpereira &
+
+VLLM_PID=$!
+echo "vLLM server started with PID $VLLM_PID"
+
+# Wait for vLLM server to be ready (check health endpoint)
+echo "Waiting for vLLM server to be ready..."
+for i in {1..60}; do
+  if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+    echo "vLLM server is ready!"
+    break
+  fi
+  echo "Waiting... ($i/60)"
+  sleep 5
+done
+
+# Run training with TRL's GRPOTrainer (uses vLLM server)
+# Training will run on GPU 0, vLLM on GPU 1
+CUDA_VISIBLE_DEVICES=0 python train_trl.py \
+  --model_name deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --num_train_problems 100 \
+  --num_eval_problems 20 \
+  --num_epochs 3 \
+  --num_generations 4 \
+  --constraint_weight 0.5 \
+  --beta 0.01 \
+  --save_steps 50 \
+  --logging_steps 5 \
+  --cache_dir /scratch-shared/dpereira \
+  --max_new_tokens 16384 \
+  --use_vllm \
+  --use_lora
+
+# Kill vLLM server when done
+echo "Training finished, stopping vLLM server..."
+kill $VLLM_PID

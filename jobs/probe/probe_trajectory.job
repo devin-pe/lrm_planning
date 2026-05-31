@@ -1,0 +1,86 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --job-name=probe_toh_transformer_trajectory
+#SBATCH --ntasks=1
+#SBATCH --time=08:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/probe_trajectory_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+# Defaults can be overridden at submission time, e.g.:
+# sbatch --export=ALL,CHECKPOINT_DIR=toh_transformer/checkpoints/n4,OUTPUT_ROOT=toh_transformer/probe_trajectory jobs/probe/probe_trajectory.job
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-toh_transformer/checkpoints/n4}
+N_DISKS=${N_DISKS:-4}
+LAYER=${LAYER:-5}
+EVAL_RESULTS=${EVAL_RESULTS:-toh_transformer/eval_output/evaluation_results.json}
+OUTPUT_ROOT=${OUTPUT_ROOT:-toh_transformer/probe_trajectory}
+DEVICE=${DEVICE:-cuda}
+MAX_TRAJECTORIES=${MAX_TRAJECTORIES:-100}
+
+export PYTHONUNBUFFERED=1
+
+echo "========== ToH Trajectory Probe =========="
+echo "Repo: $REPO_ROOT"
+echo "Checkpoint dir: $CHECKPOINT_DIR"
+echo "Checkpoint pattern: epoch_*.pt (best.pt excluded)"
+echo "N_DISKS: $N_DISKS"
+echo "LAYER: $LAYER"
+echo "EVAL_RESULTS: $EVAL_RESULTS"
+echo "OUTPUT_ROOT: $OUTPUT_ROOT"
+echo "DEVICE: $DEVICE"
+echo "MAX_TRAJECTORIES: $MAX_TRAJECTORIES"
+echo "Python: $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "=========================================="
+
+if [[ ! -d "$CHECKPOINT_DIR" ]]; then
+  echo "Checkpoint directory not found: $CHECKPOINT_DIR" >&2
+  exit 1
+fi
+
+if [[ ! -f "$EVAL_RESULTS" ]]; then
+  echo "Evaluation results file not found: $EVAL_RESULTS" >&2
+  exit 1
+fi
+
+mkdir -p "$OUTPUT_ROOT"
+
+mapfile -t CHECKPOINTS < <(find "$CHECKPOINT_DIR" -maxdepth 1 -type f -name 'epoch_*.pt' | sort)
+
+if [[ ${#CHECKPOINTS[@]} -eq 0 ]]; then
+  echo "No epoch checkpoints found in $CHECKPOINT_DIR" >&2
+  exit 1
+fi
+
+for ckpt in "${CHECKPOINTS[@]}"; do
+  ckpt_name=$(basename "$ckpt")
+  ckpt_tag="${ckpt_name%.pt}"
+  output_dir="$OUTPUT_ROOT/output_${ckpt_tag}"
+  probe_ckpt="$output_dir/probe_layer5.pt"
+
+  echo "--- Running trajectory probe for $ckpt_name -> $output_dir ---"
+  python -u toh_transformer/probe_trajectory.py \
+    --checkpoint "$ckpt" \
+    --probe_checkpoint "$probe_ckpt" \
+    --n_disks "$N_DISKS" \
+    --layer "$LAYER" \
+    --eval_results "$EVAL_RESULTS" \
+    --output_dir "$output_dir" \
+    --device "$DEVICE" \
+    --max_trajectories "$MAX_TRAJECTORIES"
+done
+
+echo "Trajectory probe run completed for ${#CHECKPOINTS[@]} epoch checkpoints."

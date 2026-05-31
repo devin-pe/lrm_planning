@@ -69,7 +69,7 @@ def main() -> None:
           f"{f'{b_correct}/{b_n} ({_pct(b_correct, b_n)})':>16} "
           f"{_fmt_int_delta(a_correct, b_correct):>17}")
 
-    for cat in ("Optimal", "Suboptimal", "Incorrect", "Illegal"):
+    for cat in ("Optimal", "Suboptimal", "Incorrect", "Illegal_format", "Illegal_moves"):
         av = a.get("solve", {}).get("category_counts", {}).get(cat, 0)
         bv = b.get("solve", {}).get("category_counts", {}).get(cat, 0)
         print(f"  {cat:<40} {av:>16d} {bv:>16d} {_fmt_int_delta(av, bv):>17}")

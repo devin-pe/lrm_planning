@@ -1,0 +1,83 @@
+#!/bin/bash
+# Set job requirements
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --partition=rome
+#SBATCH --job-name=evaluate_toh
+#SBATCH --time=06:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/evaluate_toh_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+# Defaults can be overridden at submission time, e.g.:
+# sbatch --export=ALL,CHECKPOINT=toh_transformer/checkpoints/n4/epoch_0020.pt,OUTPUT_DIR=toh_transformer/eval_output,DEVICE=cpu jobs/evaluate_toh_transformer.job
+# sbatch --export=ALL,START_EPOCH=20 jobs/evaluate_toh_transformer.job
+N_DISKS=${N_DISKS:-4}
+OUTPUT_DIR=${OUTPUT_DIR:-toh_transformer/eval_output}
+DEVICE=${DEVICE:-cpu}
+CHECKPOINT=${CHECKPOINT:-}
+START_EPOCH=${START_EPOCH:-20}
+
+export PYTHONUNBUFFERED=1
+
+echo "Running ToH full-pair evaluation"
+echo "  N_DISKS=$N_DISKS"
+echo "  OUTPUT_DIR=$OUTPUT_DIR"
+echo "  DEVICE=$DEVICE"
+if [ -n "$CHECKPOINT" ]; then
+  echo "  CHECKPOINT(single override)=$CHECKPOINT"
+else
+  echo "  CHECKPOINTS=toh_transformer/checkpoints/n${N_DISKS}/epoch_*.pt"
+  echo "  START_EPOCH=$START_EPOCH"
+fi
+
+echo "  Python=$(which python)"
+python --version
+
+declare -a CHECKPOINTS=()
+if [ -n "$CHECKPOINT" ]; then
+  if [ ! -f "$CHECKPOINT" ]; then
+    echo "ERROR: checkpoint not found: $CHECKPOINT"
+    exit 1
+  fi
+  CHECKPOINTS=("$CHECKPOINT")
+else
+  while IFS= read -r ckpt; do
+    ckpt_base=$(basename "$ckpt")
+    if [[ "$ckpt_base" =~ ^epoch_([0-9]+)\.pt$ ]]; then
+      ckpt_epoch=$((10#${BASH_REMATCH[1]}))
+      if [ "$ckpt_epoch" -ge "$START_EPOCH" ]; then
+        CHECKPOINTS+=("$ckpt")
+      fi
+    fi
+  done < <(find "toh_transformer/checkpoints/n${N_DISKS}" -maxdepth 1 -type f -name 'epoch_*.pt' | sort)
+
+  if [ ${#CHECKPOINTS[@]} -eq 0 ]; then
+    echo "ERROR: no checkpoints found in toh_transformer/checkpoints/n${N_DISKS} with epoch >= $START_EPOCH"
+    exit 1
+  fi
+fi
+
+echo "Found ${#CHECKPOINTS[@]} checkpoint(s)."
+for ckpt in "${CHECKPOINTS[@]}"; do
+  ckpt_name=$(basename "$ckpt" .pt)
+  run_output_dir="$OUTPUT_DIR/n${N_DISKS}/$ckpt_name"
+  echo "Evaluating checkpoint: $ckpt"
+  echo "  Run output dir: $run_output_dir"
+
+  python -u -m toh_transformer.evaluate \
+    --checkpoint "$ckpt" \
+    --n_disks "$N_DISKS" \
+    --output_dir "$run_output_dir" \
+    --device "$DEVICE"
+done

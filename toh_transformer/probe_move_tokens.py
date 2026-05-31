@@ -912,18 +912,19 @@ def main() -> None:
     best_layer = summary[0]["layer"]
     print(f"\nBest layer by Spearman rho: {best_layer}")
 
-    print("\nProbe Type      | Layer | Nearest-State Acc | Spearman rho | Final Loss")
-    print("----------------+-------+-------------------+--------------+-----------")
+    print("\nProbe Type      | Layer | Nearest-State Acc | Spearman rho |  Pearson r | Final Loss")
+    print("----------------+-------+-------------------+--------------+------------+-----------")
     probe_order = {"Pooled": 0, "Per-step+Token (mean)": 1}
     comparison_rows_sorted = sorted(
         comparison_rows,
         key=lambda r: (int(r["layer"]), probe_order.get(str(r["probe_type"]), 99)),
     )
     for row in comparison_rows_sorted:
+        pearson = float(row.get("pearson_r", float("nan")))
         print(
             f"{str(row['probe_type']):16s} | {int(row['layer']):5d} | "
             f"{pct(float(row['nearest_state_acc'])):>17} | {float(row['spearman_rho']):12.4f} | "
-            f"{float(row['final_loss']):9.4f}"
+            f"{pearson:10.4f} | {float(row['final_loss']):9.4f}"
         )
 
     print("[INFO] Saving labeled state maps for all layers")

@@ -1,0 +1,55 @@
+#!/bin/bash
+# Set job requirements
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --partition=rome
+#SBATCH --job-name=analyze_toh
+#SBATCH --time=4:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/analyze_toh_%A.out
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+# Defaults can be overridden at submission time, e.g.:
+# sbatch --export=ALL,CHECKPOINTS_CSV=toh_transformer/checkpoints/n4/epoch_0020.pt,toh_transformer/checkpoints/n4/epoch_0040.pt jobs/analyze_toh_transformer.job
+CHECKPOINTS_CSV=${CHECKPOINTS_CSV:-toh_transformer/checkpoints/n4/epoch_0020.pt,toh_transformer/checkpoints/n4/epoch_0040.pt}
+N_DISKS=${N_DISKS:-4}
+OUTPUT_DIR=${OUTPUT_DIR:-toh_transformer/analysis_output}
+DEVICE=${DEVICE:-cpu}
+
+IFS=',' read -r -a CHECKPOINTS <<< "$CHECKPOINTS_CSV"
+
+export PYTHONUNBUFFERED=1
+
+echo "Running ToH representation analysis"
+echo "  CHECKPOINTS_CSV=$CHECKPOINTS_CSV"
+echo "  N_DISKS=$N_DISKS"
+echo "  OUTPUT_DIR=$OUTPUT_DIR"
+echo "  DEVICE=$DEVICE"
+
+if [ ${#CHECKPOINTS[@]} -eq 0 ]; then
+    echo "ERROR: no checkpoints provided"
+    exit 1
+fi
+
+for CHECKPOINT in "${CHECKPOINTS[@]}"; do
+    if [ ! -f "$CHECKPOINT" ]; then
+        echo "ERROR: checkpoint not found: $CHECKPOINT"
+        exit 1
+    fi
+done
+
+python -u -m toh_transformer.analyze \
+	--checkpoints "${CHECKPOINTS[@]}" \
+	--n_disks "$N_DISKS" \
+	--output_dir "$OUTPUT_DIR" \
+	--device "$DEVICE" \
+	--probe_epochs 2000 \
+	--probe_lr 1e-3

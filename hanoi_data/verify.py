@@ -20,7 +20,7 @@ if str(_HERE.parent) not in sys.path:
 from hanoi_data.template import apply_move
 
 # Substrings that must never overlap a supervision span.
-FORBIDDEN_MARKERS = ("<think>", "</think>", "Move ", "State:", "->", "Solution:")
+FORBIDDEN_MARKERS = ("<think>", "</think>", "Move ", "State:", "->", "moves =")
 
 TOTAL_EXPECTED = 6480  # 3^4 * (3^4 - 1)
 TRAIN_FRAC = 0.8

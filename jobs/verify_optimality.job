@@ -1,0 +1,22 @@
+#!/bin/bash
+# Set job requirements
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --partition=rome
+#SBATCH --job-name=verify_optimality
+#SBATCH --time=04:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/verify_optimality_%A.out
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT" || exit 1
+
+python -u verify_optimality_results.py \
+  new_baseline_results/gpt-oss-120b-flat \
+  new_baseline_results/kimi-k2-think-flat \
+  new_baseline_results/deepseek-r1-flat

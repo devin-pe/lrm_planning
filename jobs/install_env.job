@@ -1,0 +1,54 @@
+#!/bin/bash
+#SBATCH --partition=rome
+#SBATCH --cpus-per-task=16
+#SBATCH --job-name=install_env
+#SBATCH --ntasks=1
+#SBATCH --time=02:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/install_env_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+echo "========== Install/Upgrade Env =========="
+echo "Repo: $REPO_ROOT"
+echo "Python: $(which python)"
+python --version
+echo "========================================="
+
+python -m pip install --upgrade pip
+python -m pip install --upgrade vllm --extra-index-url https://wheels.vllm.ai/nightly
+# vLLM pins transformers<5; force latest transformers main afterwards for Qwen3.5 config support.
+python -m pip install --upgrade --no-deps "transformers[serving] @ git+https://github.com/huggingface/transformers.git@main"
+# Keep hub version aligned with transformers main API (e.g., is_offline_mode import path).
+python -m pip install --upgrade "huggingface-hub>=1.5.0,<2.0.0"
+# Remove external flash-attn wheel built against older torch ABI.
+python -m pip uninstall -y flash-attn flash_attn || true
+
+python - <<'PY'
+from transformers import __version__ as tver
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+import vllm
+import importlib.util
+
+print(f"transformers: {tver}")
+assert "qwen3_5" in CONFIG_MAPPING, "transformers does not expose qwen3_5"
+
+spec = importlib.util.find_spec("vllm.transformers_utils.configs.qwen3_5")
+assert spec is not None, "vLLM does not expose qwen3_5 config"
+
+flash_attn_spec = importlib.util.find_spec("flash_attn")
+assert flash_attn_spec is None, "external flash_attn is still installed"
+
+print(f"vllm: {vllm.__version__}")
+print("Qwen3.5 compatibility check passed.")
+PY
+
+echo "Environment installation complete."

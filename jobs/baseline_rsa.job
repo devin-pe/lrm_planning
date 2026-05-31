@@ -1,0 +1,71 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_h100
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=200G
+#SBATCH --job-name=baseline_rsa
+#SBATCH --ntasks=1
+#SBATCH --time=01:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/baseline_rsa_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+# Override at submission time:
+#   sbatch --export=ALL,N_PROBLEMS=40,LAYERS=4,8,24,36,60,SMOKE=0 jobs/baseline_rsa.job
+MODEL_ID=${MODEL_ID:-/scratch-shared/dpereira/deepseek-r1-qwen32b}
+OUTPUT_DIR=${OUTPUT_DIR:-runs/baseline_rsa}
+N_PROBLEMS=${N_PROBLEMS:-20}
+LAYERS=${LAYERS:-8,24,36,60}
+SEED=${SEED:-42}
+SMOKE=${SMOKE:-0}
+
+export PYTHONUNBUFFERED=1
+
+SCRATCH_DIR=${SCRATCH_DIR:-/scratch-shared/dpereira}
+mkdir -p "$SCRATCH_DIR"
+export HF_HOME=${HF_HOME:-$SCRATCH_DIR/hf_cache}
+export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$SCRATCH_DIR/transformers}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$SCRATCH_DIR/datasets}
+export TORCH_HOME=${TORCH_HOME:-$SCRATCH_DIR/torch_cache}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$SCRATCH_DIR/triton_cache}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$SCRATCH_DIR/cache}
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" \
+         "$TORCH_HOME" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME"
+
+echo "========== Baseline RSA (4-disk, untrained DeepSeek-R1-32B) =========="
+echo "MODEL_ID:    $MODEL_ID"
+echo "OUTPUT_DIR:  $OUTPUT_DIR"
+echo "N_PROBLEMS:  $N_PROBLEMS"
+echo "LAYERS:      $LAYERS"
+echo "SEED:        $SEED"
+echo "SMOKE:       $SMOKE"
+echo "Python:      $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "======================================================================"
+
+mkdir -p "$OUTPUT_DIR"
+mkdir -p work
+
+CMD=(python -u baseline_rsa.py
+  --model_id "$MODEL_ID"
+  --output_dir "$OUTPUT_DIR"
+  --n_problems "$N_PROBLEMS"
+  --layers "$LAYERS"
+  --seed "$SEED"
+)
+[[ "$SMOKE" == "1" ]] && CMD+=(--smoke)
+
+"${CMD[@]}"
+
+echo "Baseline RSA complete."

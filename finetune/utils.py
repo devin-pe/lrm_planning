@@ -45,10 +45,10 @@ def idx_to_state(idx: int, n_disks: int = N_DISKS) -> State:
     return tuple(out)
 
 
-def build_graph_adjacency() -> dict:
+def build_graph_adjacency(n_disks: int = N_DISKS) -> dict:
     """state_tuple -> list of neighbouring state_tuples via one legal move."""
     adj = {}
-    for s in enumerate_states():
+    for s in enumerate_states(n_disks=n_disks):
         nbrs = []
         for fp, tp in legal_moves(s):
             # Inline-apply to avoid the planning.py round-trip for every move:
@@ -63,15 +63,15 @@ def build_graph_adjacency() -> dict:
     return adj
 
 
-def graph_distance_matrix() -> torch.Tensor:
-    """Unnormalised 81x81 BFS distance matrix.
+def graph_distance_matrix(n_disks: int = N_DISKS) -> torch.Tensor:
+    """Unnormalised 3^n × 3^n BFS distance matrix.
 
     Indexed by state_to_idx. Build with one BFS per source state.
     """
-    adj = build_graph_adjacency()
-    n = N_STATES
+    adj = build_graph_adjacency(n_disks=n_disks)
+    n = 3 ** n_disks
     dist = torch.full((n, n), float("inf"), dtype=torch.float32)
-    for src in enumerate_states():
+    for src in enumerate_states(n_disks=n_disks):
         src_idx = state_to_idx(src)
         dist[src_idx, src_idx] = 0.0
         q = deque([src])
@@ -84,13 +84,13 @@ def graph_distance_matrix() -> torch.Tensor:
                     dist[src_idx, v_idx] = dist[src_idx, u_idx] + 1.0
                     q.append(v)
     if torch.isinf(dist).any():
-        raise RuntimeError("Disconnected states in 4-disk Hanoi graph")
+        raise RuntimeError(f"Disconnected states in {n_disks}-disk Hanoi graph")
     return dist
 
 
-def normalised_graph_distance_matrix() -> torch.Tensor:
+def normalised_graph_distance_matrix(n_disks: int = N_DISKS) -> torch.Tensor:
     """Divide by std-dev over off-diagonal entries so the MSE target is well-conditioned."""
-    dist = graph_distance_matrix()
+    dist = graph_distance_matrix(n_disks=n_disks)
     n = dist.shape[0]
     mask = ~torch.eye(n, dtype=torch.bool)
     sd = float(dist[mask].std().clamp(min=1e-8))

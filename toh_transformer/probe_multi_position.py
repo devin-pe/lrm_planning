@@ -785,22 +785,26 @@ def main() -> None:
         k_rows_sorted = sorted(k_rows, key=lambda r: (r["nearest_state_acc"], r["spearman_rho"]), reverse=True)
         best_by_k[k] = k_rows_sorted[0]
 
-    print("\nK  | Layer | Nearest-State Acc | Spearman rho | Early Acc | Mid Acc | Late Acc | Anchor Coverage")
-    print("---+-------+-------------------+--------------+-----------+---------+---------+----------------")
+    print("\nK  | Layer | Nearest-State Acc | Spearman rho |  Pearson r | Early Acc | Mid Acc | Late Acc | Anchor Coverage")
+    print("---+-------+-------------------+--------------+------------+-----------+---------+---------+----------------")
     rows_sorted = sorted(results_rows, key=lambda r: (int(r["K"]), int(r["layer"])))
     for r in rows_sorted:
+        pearson = float(r.get("pearson_r", float("nan")))
         print(
             f"{int(r['K']):2d} | {int(r['layer']):5d} | {pct(r['nearest_state_acc']):>17} | "
-            f"{r['spearman_rho']:12.4f} | {pct(r['early_acc']):>9} | {pct(r['mid_acc']):>7} | {pct(r['late_acc']):>8} | "
+            f"{r['spearman_rho']:12.4f} | {pearson:10.4f} | "
+            f"{pct(r['early_acc']):>9} | {pct(r['mid_acc']):>7} | {pct(r['late_acc']):>8} | "
             f"{pct(r['anchor_coverage']):>14}"
         )
 
-    print("\nK  | Best Layer | Nearest-State Acc | Spearman rho")
-    print("---+------------+-------------------+--------------")
+    print("\nK  | Best Layer | Nearest-State Acc | Spearman rho |  Pearson r")
+    print("---+------------+-------------------+--------------+------------")
     for k in WINDOW_SIZES:
         r = best_by_k[k]
+        pearson = float(r.get("pearson_r", float("nan")))
         print(
-            f"{k:2d} | {int(r['layer']):10d} | {pct(r['nearest_state_acc']):>17} | {r['spearman_rho']:12.4f}"
+            f"{k:2d} | {int(r['layer']):10d} | {pct(r['nearest_state_acc']):>17} | "
+            f"{r['spearman_rho']:12.4f} | {pearson:10.4f}"
         )
 
     if best_global is None:

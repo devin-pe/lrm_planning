@@ -20,9 +20,9 @@ from eval.optimality import classify_moves  # noqa: E402
 from hanoi_data.template import get_prompts  # noqa: E402
 from planning import _extract_moves_block, _parse_moves_json  # noqa: E402
 
-# Regex captures everything from "Solution:" to end of generated text; the
+# Regex captures everything from "moves = " to end of generated text; the
 # bracket-balanced extractor then pulls out the outer list.
-_SOLUTION_HEADER = re.compile(r"Solution\s*:", re.IGNORECASE)
+_SOLUTION_HEADER = re.compile(r"\bmoves\s*=\s*\[", re.IGNORECASE)
 
 
 def build_prompt(tokenizer, s_I, s_G) -> str:
@@ -37,11 +37,9 @@ def build_prompt(tokenizer, s_I, s_G) -> str:
 
 
 def extract_solution(text: str) -> Optional[List[List[int]]]:
-    m = _SOLUTION_HEADER.search(text)
-    if m is None:
-        return None
-    after = text[m.end():]
-    block = _extract_moves_block("moves = " + after)  # synthesize header for the extractor
+    # _extract_moves_block already does the right thing: it finds the LAST
+    # complete `moves = [...]` block in the text (bracket-balanced).
+    block = _extract_moves_block(text)
     if block is None:
         return None
     try:
@@ -77,9 +75,10 @@ def _model_input_device(model) -> torch.device:
 @torch.no_grad()
 def _greedy_generate_batched(
     model, tokenizer, prompts: List[str], max_new_tokens: int,
-) -> List[str]:
-    """Batched greedy generation. Left-pads so all prompts end at the same
-    position; decode each row's new tokens after the original prompt length.
+) -> Tuple[List[str], List[bool]]:
+    """Batched greedy generation. Returns (decoded_texts, truncated_flags).
+    `truncated_flags[i]` is True iff that row's completion ran into the
+    `max_new_tokens` cap without ever emitting an EOS token.
     """
     saved_side = getattr(tokenizer, "padding_side", "right")
     tokenizer.padding_side = "left"
@@ -103,7 +102,13 @@ def _greedy_generate_batched(
     )
     prompt_len = input_ids.shape[1]
     new_tok_batch = gen[:, prompt_len:]
-    return tokenizer.batch_decode(new_tok_batch, skip_special_tokens=True)
+    # Truncation = row never emitted EOS within max_new_tokens.
+    eos_id = tokenizer.eos_token_id
+    truncated = [
+        bool(eos_id is None or (new_tok_batch[i] != eos_id).all().item())
+        for i in range(new_tok_batch.shape[0])
+    ]
+    return tokenizer.batch_decode(new_tok_batch, skip_special_tokens=True), truncated
 
 
 def run_solve_eval(
@@ -121,37 +126,70 @@ def run_solve_eval(
     cat_counter: Counter = Counter()
     by_len_cats: Dict[int, Counter] = defaultdict(Counter)
     bs = max(1, batch_size)
+    n_truncated = 0
+    n_format_invalid = 0  # subset: truncated AND no parsed `moves = […]`
 
     i = 0
+    cats_for_log = ("Optimal", "Suboptimal", "Incorrect", "Illegal_format", "Illegal_moves")
     while i < len(sub):
         chunk = sub[i: i + bs]
         prompts = [build_prompt(tokenizer, tuple(r["s_I"]), tuple(r["s_G"])) for r in chunk]
-        gen_texts = _greedy_generate_batched(model, tokenizer, prompts, max_new_tokens)
+        gen_texts, truncated_flags = _greedy_generate_batched(
+            model, tokenizer, prompts, max_new_tokens,
+        )
 
-        for j, (row, gen_text) in enumerate(zip(chunk, gen_texts)):
+        for j, (row, gen_text, was_truncated) in enumerate(
+            zip(chunk, gen_texts, truncated_flags)
+        ):
             s_I = tuple(row["s_I"])
             s_G = tuple(row["s_G"])
             moves = extract_solution(gen_text)
             cls = classify_moves(s_I, s_G, moves)
+            if (i + j) < 2:
+                tail = gen_text[-200:].replace("\n", "\\n")
+                print(f"  [solve/sanity] prob {i+j}  s_I={s_I} s_G={s_G}  "
+                      f"len(gen_text)={len(gen_text)}  parsed_moves={moves}")
+                print(f"  [solve/sanity]   tail: …{tail!r}")
             cat_counter[cls["category"]] += 1
             by_len_cats[cls["optimal_len"]][cls["category"]] += 1
+            if was_truncated:
+                n_truncated += 1
+            # format_invalid: ran out of tokens BEFORE the model emitted
+            # `moves = […]`. Distinct from the model emitting a malformed
+            # move sequence inside an otherwise-present block (that's
+            # Illegal_moves).
+            this_format_invalid = was_truncated and moves is None
+            if this_format_invalid:
+                n_format_invalid += 1
 
             per_problem.append({
                 "s_I": list(s_I), "s_G": list(s_G),
                 "optimal_len": cls["optimal_len"],
                 "generated_moves": moves,
+                "truncated": was_truncated,
+                "format_invalid": this_format_invalid,
                 **{k: v for k, v in cls.items() if k != "optimal_len"},
             })
 
         i += bs
-        running = " ".join(f"{k}={cat_counter[k]}" for k in ("Optimal", "Suboptimal", "Incorrect", "Illegal"))
-        print(f"  [solve] {min(i, len(sub)):4d}/{len(sub)}  {running}")
+        running = " ".join(f"{k}={cat_counter[k]}" for k in cats_for_log)
+        print(f"  [solve] {min(i, len(sub)):4d}/{len(sub)}  {running}  "
+              f"trunc={n_truncated}  fmt_invalid={n_format_invalid}")
+
+    if n_truncated:
+        print(f"\n[solve] WARNING: {n_truncated}/{len(sub)} completions hit "
+              f"max_new_tokens={max_new_tokens} without emitting EOS  "
+              f"({n_format_invalid} of those never emitted a `moves = […]` block — "
+              f"counted as Illegal_format).")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "solve_results.json").write_text(json.dumps({
         "n": len(sub),
         "category_counts": dict(cat_counter),
         "by_optimal_length": {str(L): dict(c) for L, c in sorted(by_len_cats.items())},
+        "n_truncated": n_truncated,
+        "n_format_invalid": n_format_invalid,
+        "max_new_tokens": max_new_tokens,
         "per_problem": per_problem,
     }, indent=2))
 
@@ -159,4 +197,7 @@ def run_solve_eval(
         "n": len(sub),
         "category_counts": dict(cat_counter),
         "by_optimal_length": {str(L): dict(c) for L, c in sorted(by_len_cats.items())},
+        "n_truncated": n_truncated,
+        "n_format_invalid": n_format_invalid,
+        "max_new_tokens": max_new_tokens,
     }

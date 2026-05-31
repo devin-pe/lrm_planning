@@ -1,0 +1,106 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_h100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=120G
+#SBATCH --job-name=dsr1_qwen32b_toh_probe
+#SBATCH --ntasks=1
+#SBATCH --time=24:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/deepseek_r1_qwen32b_probe_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+MODEL_NAME=${MODEL_NAME:-/scratch-shared/dpereira/deepseek-r1-qwen32b}
+N_DISKS=${N_DISKS:-4}
+OUTPUT_DIR=${OUTPUT_DIR:-outputs/deepseek_r1_qwen32b_probe}
+DEVICE=${DEVICE:-cuda}
+DTYPE=${DTYPE:-bfloat16}
+EPOCHS=${EPOCHS:-2000}
+LR=${LR:-1e-3}
+SEED=${SEED:-42}
+BATCH_SIZE=${BATCH_SIZE:-4}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}
+MAX_TOKENS=${MAX_TOKENS:-12288}
+TEMPERATURE=${TEMPERATURE:-1.0}
+TOP_P=${TOP_P:-0.95}
+TOP_K=${TOP_K:-20}
+MIN_P=${MIN_P:-0.0}
+PRESENCE_PENALTY=${PRESENCE_PENALTY:-1.5}
+
+export PYTHONUNBUFFERED=1
+
+SCRATCH_DIR=${SCRATCH_DIR:-/scratch-shared/dpereira}
+mkdir -p "$SCRATCH_DIR"
+export HF_HOME=${HF_HOME:-$SCRATCH_DIR/hf_cache}
+export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$SCRATCH_DIR/transformers}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$SCRATCH_DIR/datasets}
+export TORCH_HOME=${TORCH_HOME:-$SCRATCH_DIR/torch_cache}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$SCRATCH_DIR/triton_cache}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$SCRATCH_DIR/cache}
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" \
+         "$TORCH_HOME" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME"
+
+echo "========== DeepSeek-R1-Distill-Qwen-32B ToH Probe =========="
+echo "MODEL_NAME:       $MODEL_NAME"
+echo "N_DISKS:          $N_DISKS"
+echo "OUTPUT_DIR:       $OUTPUT_DIR"
+echo "DEVICE:           $DEVICE"
+echo "DTYPE:            $DTYPE"
+echo "EPOCHS:           $EPOCHS"
+echo "LR:               $LR"
+echo "SEED:             $SEED"
+echo "BATCH_SIZE:       $BATCH_SIZE"
+echo "MAX_MODEL_LEN:    $MAX_MODEL_LEN"
+echo "MAX_TOKENS:       $MAX_TOKENS"
+echo "TEMPERATURE:      $TEMPERATURE"
+echo "PRESENCE_PENALTY: $PRESENCE_PENALTY"
+echo "Python:           $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "============================================================="
+
+mkdir -p "$OUTPUT_DIR"
+mkdir -p work
+
+# ── Step 1: Generate responses for all 81 states (vLLM) ──────────────────────
+echo "[Step 1] Generating responses with vLLM..."
+python -u generate.py \
+  --model              "$MODEL_NAME"       \
+  --tokenizer          "$MODEL_NAME"       \
+  --n_disks            "$N_DISKS"          \
+  --output_dir         "$OUTPUT_DIR"       \
+  --dtype              "$DTYPE"            \
+  --max_model_len      "$MAX_MODEL_LEN"    \
+  --max_tokens         "$MAX_TOKENS"       \
+  --temperature        "$TEMPERATURE"      \
+  --top_p              "$TOP_P"            \
+  --top_k              "$TOP_K"            \
+  --min_p              "$MIN_P"            \
+  --presence_penalty   "$PRESENCE_PENALTY" \
+  --seed               "$SEED"
+
+# ── Step 2: Probe hidden states (HF transformers) ────────────────────────────
+# vLLM process has exited so GPU memory is fully free before this step.
+echo "[Step 2] Probing hidden states..."
+python -u probe.py \
+  --model_name  "$MODEL_NAME"  \
+  --n_disks     "$N_DISKS"     \
+  --output_dir  "$OUTPUT_DIR"  \
+  --device      "$DEVICE"      \
+  --dtype       "$DTYPE"       \
+  --epochs      "$EPOCHS"      \
+  --lr          "$LR"          \
+  --seed        "$SEED"        \
+  --batch_size  "$BATCH_SIZE"
+
+echo "DeepSeek-R1-Distill-Qwen-32B generation and probe completed."

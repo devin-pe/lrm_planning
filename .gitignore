@@ -1,17 +1,52 @@
-baseline_results/
-work/
-baseline_env/
+# Build/runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Tooling caches
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local environments
 env/
+baseline_env/
 flash-attention/
-training_outputs/
 .env
-jobs/
-new_baseline_results/
+
+# Experiment outputs
+outputs/
+runs/
+work/
+training_outputs/
 agent_results/
+baseline_results/
+new_baseline_results/
 experiments/
+figures/
+media/
 graphs/
+
+# Large generated datasets
+hanoi_data/*.jsonl
+
+# Model artifacts (belt-and-suspenders; most live in runs/ already)
+*.pt
+*.safetensors
+*.bin
+
+
+# Per-experiment toh_transformer outputs
 toh_transformer/checkpoints
-toh_transformer/__pycache__
 toh_transformer/analysis_output/
 toh_transformer/eval_output
 toh_transformer/probe
@@ -24,11 +59,6 @@ toh_transformer/probe_old__move_tokens_output
 toh_transformer/probe_trajectory
 toh_transformer/representation_analysis_output
 toh_transformer/sae_old_analysis_output/
-outputs/
-hanoi_data/train.jsonl
-hanoi_data/test.jsonl
-hanoi_data/__pycache__
-eval/__pycache__
-finetune/__pycache__
-runs/
+
+# Tool-managed state
 .claude/

@@ -1,0 +1,129 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_h100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=120G
+#SBATCH --job-name=new_baseline_vllm
+#SBATCH --ntasks=1
+#SBATCH --time=24:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/new_baseline_vllm_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+MODEL_PATH=${MODEL_PATH:-/scratch-shared/dpereira/qwen3.6-27b}
+MODEL_ALIAS=${MODEL_ALIAS:-qwen3.6-27b}
+NUM_PROBLEMS=${NUM_PROBLEMS:-100}
+DISK_RANGE=${DISK_RANGE:-3,4,5}
+PROBLEM_MODE=${PROBLEM_MODE:-nonstandard}
+SEED=${SEED:-42}
+MAX_TOKENS=${MAX_TOKENS:-12288}
+TEMPERATURE=${TEMPERATURE:-1.0}
+TOP_P=${TOP_P:-0.95}
+TOP_K=${TOP_K:-20}
+MIN_P=${MIN_P:-0.0}
+VLLM_PORT=${VLLM_PORT:-8000}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.90}
+
+export PYTHONUNBUFFERED=1
+
+SCRATCH_DIR=${SCRATCH_DIR:-/scratch-shared/dpereira}
+export HF_HOME=${HF_HOME:-$SCRATCH_DIR/hf_cache}
+export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$SCRATCH_DIR/transformers}
+export TORCH_HOME=${TORCH_HOME:-$SCRATCH_DIR/torch_cache}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$SCRATCH_DIR/triton_cache}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$SCRATCH_DIR/cache}
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$TORCH_HOME" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME"
+
+# Kill vLLM server on exit (success or failure)
+VLLM_PID=""
+cleanup() {
+    if [[ -n "$VLLM_PID" ]]; then
+        echo "[INFO] Shutting down vLLM server (PID $VLLM_PID)"
+        kill "$VLLM_PID" 2>/dev/null || true
+        wait "$VLLM_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+echo "========== New Baseline (vLLM) =========="
+echo "MODEL_PATH:    $MODEL_PATH"
+echo "MODEL_ALIAS:   $MODEL_ALIAS"
+echo "NUM_PROBLEMS:  $NUM_PROBLEMS"
+echo "DISK_RANGE:    $DISK_RANGE"
+echo "PROBLEM_MODE:  $PROBLEM_MODE"
+echo "SEED:          $SEED"
+echo "MAX_TOKENS:    $MAX_TOKENS"
+echo "MAX_MODEL_LEN: $MAX_MODEL_LEN"
+echo "Python:        $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "=========================================="
+
+VLLM_LOG="$REPO_ROOT/work/vllm_baseline_${SLURM_JOB_ID:-local}.log"
+
+echo "[INFO] Starting vLLM server..."
+vllm serve "$MODEL_PATH" \
+    --served-model-name "$MODEL_ALIAS" \
+    --dtype bfloat16 \
+    --max-model-len "$MAX_MODEL_LEN" \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
+    --trust-remote-code \
+    --port "$VLLM_PORT" \
+    > "$VLLM_LOG" 2>&1 &
+VLLM_PID=$!
+echo "[INFO] vLLM PID: $VLLM_PID  (log: $VLLM_LOG)"
+
+echo "[INFO] Waiting for vLLM server to become ready..."
+READY=0
+for i in $(seq 1 120); do
+    if curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; then
+        echo "[INFO] vLLM ready after ~$((i * 10)) seconds"
+        READY=1
+        break
+    fi
+    if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+        echo "[ERROR] vLLM process died. Check $VLLM_LOG"
+        exit 1
+    fi
+    sleep 10
+done
+
+if [[ "$READY" -eq 0 ]]; then
+    echo "[ERROR] vLLM did not become ready within 1200 seconds. Check $VLLM_LOG"
+    exit 1
+fi
+
+echo "[INFO] Running new_baseline_vllm.py..."
+MODEL_NAME="$MODEL_ALIAS" \
+VLLM_BASE_URL="http://localhost:${VLLM_PORT}/v1" \
+NUM_PROBLEMS="$NUM_PROBLEMS" \
+DISK_RANGE="$DISK_RANGE" \
+PROBLEM_MODE="$PROBLEM_MODE" \
+SEED="$SEED" \
+MAX_TOKENS="$MAX_TOKENS" \
+TEMPERATURE="$TEMPERATURE" \
+TOP_P="$TOP_P" \
+TOP_K="$TOP_K" \
+MIN_P="$MIN_P" \
+python -u new_baseline_vllm.py
+
+echo "[INFO] Baseline run complete."
+
+RUN_DIR=$(ls -td new_baseline_results/run_* 2>/dev/null | head -1)
+if [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]]; then
+    echo "[INFO] Running verify_optimality_results.py on $RUN_DIR"
+    python -u verify_optimality_results.py "$RUN_DIR"
+else
+    echo "[WARN] Could not find a run_* directory under new_baseline_results; skipping verify."
+fi

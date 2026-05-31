@@ -1518,11 +1518,12 @@ def print_state_table(state_rec: Dict[str, object]) -> None:
 
 def print_2d_comparison_table(rows: Sequence[Dict[str, object]]) -> None:
     print("\n2D probe quality comparison")
-    print("Input to 2D probe    | Nearest-State Acc | Spearman rho")
-    print("---------------------+-------------------+-------------")
+    print("Input to 2D probe    | Nearest-State Acc | Spearman rho |  Pearson r")
+    print("---------------------+-------------------+--------------+-----------")
     for r in rows:
         print(
-            f"{str(r['input']):21s} | {100.0 * float(r['nearest_state_acc']):16.2f}% | {float(r['spearman_rho']):11.4f}"
+            f"{str(r['input']):21s} | {100.0 * float(r['nearest_state_acc']):16.2f}% | "
+            f"{float(r['spearman_rho']):12.4f} | {float(r.get('pearson_r', float('nan'))):10.4f}"
         )
 
 
@@ -1575,6 +1576,13 @@ def print_move_metric_matrix(
         f"{get(l1, 'sae', 'spearman_rho'):11.4f} | "
         f"{get(l2, 'raw', 'spearman_rho'):11.4f} | "
         f"{get(l2, 'sae', 'spearman_rho'):10.4f}"
+    )
+    print(
+        "Pearson r                       | "
+        f"{get(l1, 'raw', 'pearson_r'):11.4f} | "
+        f"{get(l1, 'sae', 'pearson_r'):11.4f} | "
+        f"{get(l2, 'raw', 'pearson_r'):11.4f} | "
+        f"{get(l2, 'sae', 'pearson_r'):10.4f}"
     )
 
 

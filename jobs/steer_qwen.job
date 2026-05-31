@@ -1,0 +1,120 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_h100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=200G
+#SBATCH --job-name=qwen_steer
+#SBATCH --ntasks=1
+#SBATCH --time=48:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/steer_qwen_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+# Override at submission time with:
+# sbatch --export=ALL,MODEL_NAME=...,ALPHAS=... jobs/steer_qwen.job
+MODEL_NAME=${MODEL_NAME:-/scratch-shared/dpereira/qwen3.6-27b}
+HIDDEN_STATES=${HIDDEN_STATES:-outputs/qwen_probe/hidden_states.pt}
+N_DISKS=${N_DISKS:-4}
+LAYER=${LAYER:-36}
+EXTRA_LAYERS=${EXTRA_LAYERS:-}
+ALPHAS=${ALPHAS:-0.5,1,2,5,10,20}
+OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen_steering}
+DEVICE=${DEVICE:-cuda}
+DTYPE=${DTYPE:-bfloat16}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-13000}
+N_PROBLEMS=${N_PROBLEMS:-81}
+SEED=${SEED:-42}
+PROBE_DIR=${PROBE_DIR:-outputs/qwen_probe}
+DECODE_EVERY=${DECODE_EVERY:-1}
+RUN_BASELINE=${RUN_BASELINE:-0}
+SAVE_TEXTS=${SAVE_TEXTS:-0}
+FAILED_ONLY=${FAILED_ONLY:-1}
+ALWAYS_STEER=${ALWAYS_STEER:-0}
+BATCH_SIZE=${BATCH_SIZE:-8}
+EVAL_RESULTS=${EVAL_RESULTS:-outputs/qwen_probe/evaluate_qwen_results.json}
+
+export PYTHONUNBUFFERED=1
+
+SCRATCH_DIR=${SCRATCH_DIR:-/scratch-shared/dpereira}
+mkdir -p "$SCRATCH_DIR"
+export HF_HOME=${HF_HOME:-$SCRATCH_DIR/hf_cache}
+export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$SCRATCH_DIR/transformers}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$SCRATCH_DIR/datasets}
+export TORCH_HOME=${TORCH_HOME:-$SCRATCH_DIR/torch_cache}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$SCRATCH_DIR/triton_cache}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$SCRATCH_DIR/cache}
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" \
+         "$TORCH_HOME" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME"
+
+echo "========== Qwen Directional Steering =========="
+echo "MODEL_NAME:        $MODEL_NAME"
+echo "HIDDEN_STATES:     $HIDDEN_STATES"
+echo "N_DISKS:           $N_DISKS"
+echo "LAYER:             $LAYER"
+echo "EXTRA_LAYERS:      $EXTRA_LAYERS"
+echo "ALPHAS:            $ALPHAS"
+echo "OUTPUT_DIR:        $OUTPUT_DIR"
+echo "DEVICE:            $DEVICE"
+echo "DTYPE:             $DTYPE"
+echo "MAX_NEW_TOKENS:    $MAX_NEW_TOKENS"
+echo "N_PROBLEMS:        $N_PROBLEMS"
+echo "SEED:              $SEED"
+echo "PROBE_DIR:         $PROBE_DIR"
+echo "DECODE_EVERY:      $DECODE_EVERY"
+echo "RUN_BASELINE:      $RUN_BASELINE"
+echo "SAVE_TEXTS:        $SAVE_TEXTS"
+echo "Python:            $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "==============================================="
+
+mkdir -p "$OUTPUT_DIR"
+mkdir -p work
+
+CMD=(python -u steer_qwen.py
+  --model_name       "$MODEL_NAME"
+  --hidden_states    "$HIDDEN_STATES"
+  --n_disks          "$N_DISKS"
+  --layer            "$LAYER"
+  --alphas           "$ALPHAS"
+  --output_dir       "$OUTPUT_DIR"
+  --device           "$DEVICE"
+  --dtype            "$DTYPE"
+  --max_new_tokens   "$MAX_NEW_TOKENS"
+  --n_problems       "$N_PROBLEMS"
+  --seed             "$SEED"
+  --probe_dir        "$PROBE_DIR"
+  --decode_every     "$DECODE_EVERY"
+  --batch_size       "$BATCH_SIZE"
+  --eval_results     "$EVAL_RESULTS"
+)
+
+if [[ -n "$EXTRA_LAYERS" ]]; then
+  CMD+=(--extra_layers "$EXTRA_LAYERS")
+fi
+if [[ "$RUN_BASELINE" == "1" ]]; then
+  CMD+=(--run_baseline)
+fi
+if [[ "$SAVE_TEXTS" == "1" ]]; then
+  CMD+=(--save_texts)
+fi
+if [[ "$FAILED_ONLY" == "1" ]]; then
+  CMD+=(--failed_only)
+fi
+if [[ "$ALWAYS_STEER" == "1" ]]; then
+  CMD+=(--always_steer)
+fi
+
+"${CMD[@]}"
+
+echo "Qwen directional steering completed."

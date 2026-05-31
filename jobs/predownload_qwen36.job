@@ -1,0 +1,77 @@
+#!/bin/bash
+#SBATCH --partition=rome
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --job-name=predl_qwen36
+#SBATCH --ntasks=1
+#SBATCH --time=08:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/predownload_qwen36_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+MODEL_ID=${MODEL_ID:-Qwen/Qwen3.6-27B}
+TARGET_DIR=${TARGET_DIR:-/scratch-shared/dpereira/qwen3.6-27b}
+SCRATCH_DIR=${SCRATCH_DIR:-/scratch-shared/dpereira}
+export MODEL_ID TARGET_DIR SCRATCH_DIR
+
+# Keep HF cache on scratch to avoid home quota usage.
+export HF_HOME=${HF_HOME:-$SCRATCH_DIR/hf_cache}
+export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$SCRATCH_DIR/transformers}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$SCRATCH_DIR/datasets}
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE"
+
+mkdir -p "$TARGET_DIR"
+
+echo "========== Predownload Model =========="
+echo "MODEL_ID: $MODEL_ID"
+echo "TARGET_DIR: $TARGET_DIR"
+echo "HF_HOME: $HF_HOME"
+echo "TRANSFORMERS_CACHE: $TRANSFORMERS_CACHE"
+echo "HF_DATASETS_CACHE: $HF_DATASETS_CACHE"
+echo "Python: $(which python)"
+python --version
+echo "======================================="
+
+python - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+
+model_id = os.getenv("MODEL_ID", "Qwen/Qwen3.6-27B")
+target_dir = os.getenv("TARGET_DIR", "/scratch-shared/dpereira/qwen3.6-27b")
+
+print(f"Downloading {model_id} to {target_dir} ...")
+# Full snapshot so vLLM can load directly from TARGET_DIR.
+out = snapshot_download(
+    repo_id=model_id,
+    repo_type="model",
+    local_dir=target_dir,
+    local_dir_use_symlinks=False,
+    resume_download=True,
+)
+print(f"snapshot_download returned: {out}")
+PY
+
+if [[ ! -f "$TARGET_DIR/config.json" ]]; then
+  echo "[ERROR] Missing $TARGET_DIR/config.json after download."
+  exit 1
+fi
+
+echo "Download complete. Sanity check:"
+ls -lh "$TARGET_DIR/config.json"
+
+# Optional quick checks for common files.
+for f in tokenizer.json tokenizer_config.json generation_config.json; do
+  if [[ -f "$TARGET_DIR/$f" ]]; then
+    echo "Found: $TARGET_DIR/$f"
+  fi
+done
+
+echo "Model predownload finished successfully."

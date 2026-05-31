@@ -108,6 +108,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--always_steer", action="store_true",
                    help="Steer during CoT too (legacy). Default: hook is dormant "
                         "until the model emits 'moves = [' in its output.")
+    p.add_argument("--debug_steering", action="store_true",
+                   help="Print one-shot diagnostics on the FIRST hook call: "
+                        "module class, output tuple structure, dtype/shape/norm "
+                        "of hidden state, direction, delta, before/after diff. "
+                        "Off by default to keep production logs clean.")
+    p.add_argument("--skip_sanity", action="store_true",
+                   help="Skip the alpha=0 vs alpha=20 differential test that "
+                        "runs once at startup. Default: the test always runs "
+                        "and ABORTS if outputs are byte-identical.")
+    p.add_argument("--gate_on_sanity", action="store_true",
+                   help="Run an ADDITIONAL diagnostic at startup: generate one "
+                        "full sequence (up to --gate_sanity_max_tokens) with "
+                        "the gate active (steering activates only after "
+                        "</think>+moves=[) at α=0 and at α=200, then compare "
+                        "the first 30 post-gate tokens. Classifies the layer "
+                        "into BRANCH 1 (steerable, gate doesn't block), "
+                        "BRANCH 2 (steerable but gate-blocked → cache "
+                        "dominance), or BRANCH 3 (layer not steerable). "
+                        "Aborts on BRANCH 2 or 3.")
+    p.add_argument("--gate_sanity_max_tokens", type=int, default=8000,
+                   help="Token budget for each gate-on sanity generation "
+                        "(needs to be long enough to pass </think>+moves=[). "
+                        "Default 8000 (~2-3 min per generation on H100).")
+    p.add_argument("--gate_sanity_escalate_alpha", type=float, default=500.0,
+                   help="If α=200 fails BOTH gate-on and gate-off (existing "
+                        "sanity), retry once at this α before classifying as "
+                        "BRANCH 3.")
     return p.parse_args()
 
 
@@ -381,16 +408,106 @@ def get_layers_list(text_model: nn.Module):
 
 # ── Steering hook ──────────────────────────────────────────────────────────────
 
+# Module-level guard so the first-call debug printout happens exactly once
+# across ALL SteeringHook instances (hooks get created/destroyed per sweep
+# cell). The hook short-circuits past the diagnostic block once flipped.
+_STEERING_DEBUG_PRINTED: bool = False
+# Toggled by main() based on --debug_steering. Hooks read this on every
+# call (cheap) and only do the heavy printing when both flags align.
+_STEERING_DEBUG_ENABLED: bool = False
+
+
+def _module_path_in_model(model: nn.Module, target: nn.Module) -> str:
+    """Best-effort name lookup so the debug block can print where the hook
+    actually attached (e.g. `model.model.layers[35].mlp` would expose a
+    layer-vs-sub-module mistake)."""
+    for name, mod in model.named_modules():
+        if mod is target:
+            return name or "<root>"
+    return "<not-found-in-model>"
+
+
+def _hook_debug_dump(
+    module: nn.Module, output, direction: torch.Tensor, alpha: float,
+    *, model_for_lookup: Optional[nn.Module] = None,
+) -> None:
+    """Verifies every link in the chain on the very first hook call:
+    module identity → output structure → hidden state stats → direction
+    stats → delta after dtype cast → actual before/after diff norm.
+
+    Prints with the [steer-debug] prefix so a `grep steer-debug <out>`
+    yields the full sanity record from a single forward.
+    """
+    print("[steer-debug] === HOOK FIRST CALL ===")
+    print(f"[steer-debug] module class: {type(module).__name__}")
+    if model_for_lookup is not None:
+        path = _module_path_in_model(model_for_lookup, module)
+        print(f"[steer-debug] module name in model: {path}")
+    print(f"[steer-debug] output type: {type(output).__name__}")
+    if isinstance(output, tuple):
+        print(f"[steer-debug] output tuple len: {len(output)}")
+        for i, item in enumerate(output):
+            if torch.is_tensor(item):
+                print(f"[steer-debug]   output[{i}]: tensor shape={tuple(item.shape)} "
+                      f"dtype={item.dtype} norm={float(item.float().norm()):.4f}")
+            else:
+                print(f"[steer-debug]   output[{i}]: {type(item).__name__} (non-tensor)")
+        hs = output[0]
+    else:
+        hs = output
+    print(f"[steer-debug] hidden_state to modify: shape={tuple(hs.shape)} dtype={hs.dtype}")
+    print(f"[steer-debug]   norm={float(hs.float().norm()):.4f}  "
+          f"abs_mean={float(hs.float().abs().mean()):.6f}")
+    print(f"[steer-debug] direction: shape={tuple(direction.shape)}  "
+          f"dtype={direction.dtype}  device={direction.device}")
+    print(f"[steer-debug]   norm={float(direction.float().norm()):.4f}  "
+          f"abs_mean={float(direction.float().abs().mean()):.6f}")
+    print(f"[steer-debug]   first 5 values: {direction.float().flatten()[:5].tolist()}")
+    print(f"[steer-debug] alpha={alpha}  type={type(alpha).__name__}")
+
+    # Reproduce the same arithmetic the hook itself will apply.
+    delta_fp32 = (alpha * direction.float()).to(direction.device)
+    delta_cast = delta_fp32.to(hs.dtype)
+    print(f"[steer-debug] delta (alpha·direction):")
+    print(f"[steer-debug]   fp32  abs_mean={float(delta_fp32.abs().mean()):.6f}  "
+          f"abs_max={float(delta_fp32.abs().max()):.6f}  "
+          f"norm={float(delta_fp32.norm()):.4f}")
+    print(f"[steer-debug]   cast to {hs.dtype}: "
+          f"abs_mean={float(delta_cast.float().abs().mean()):.6f}  "
+          f"abs_max={float(delta_cast.float().abs().max()):.6f}  "
+          f"norm={float(delta_cast.float().norm()):.4f}")
+    nz_frac = float((delta_cast != 0).float().mean())
+    print(f"[steer-debug]   nonzero fraction after cast: {nz_frac:.4f}  "
+          f"({'underflow!' if nz_frac < 0.5 else 'ok'})")
+
+    # Apply against the LAST token slice — the same slice the real hook
+    # mutates. Detach + clone so we don't side-effect.
+    hs_last_before = hs[..., -1:, :].detach().clone()
+    hs_last_after = hs_last_before + delta_cast.to(hs_last_before.dtype)
+    actual_diff = float((hs_last_after - hs_last_before).float().norm())
+    norm_before = float(hs_last_before.float().norm())
+    ratio = actual_diff / norm_before if norm_before > 0 else float("nan")
+    print(f"[steer-debug] last-token slice norm: before={norm_before:.4f}  "
+          f"diff_after_add={actual_diff:.4f}  ratio={ratio:.6f}")
+    if actual_diff == 0.0:
+        print("[steer-debug] ⚠ actual_diff == 0 — bf16 underflow or wrong slot. "
+              "Hook is a no-op on the residual stream.")
+    print("[steer-debug] === END HOOK DEBUG ===\n")
+
+
 class SteeringHook:
     """Forward hook on one transformer layer; rewrites residual at the LAST tok.
 
     Directional steering:  h[-1] += alpha * unit(target - mean)
 
     The hook is REGISTERED throughout but stays *dormant* (no-op) until
-    `moves_phase_active` is flipped on. The generation loop turns it on the
-    moment the model emits the final-answer header `moves = [`. This keeps
-    the model's CoT untouched and steers only the move-output tokens, cutting
-    steered forward passes from ~12k/problem to ~50–100.
+    `moves_phase_active` is flipped on. The generation loop turns it on
+    AFTER the model first emits `</think>` (R1's CoT-close token) and then
+    the final-answer header `moves = [`. Gating on </think> matters because
+    R1's CoT routinely speculates with phrases like "let me try moves = […]";
+    triggering on those would steer the entire CoT and collapse the reasoning.
+    With the gate, the hook fires only on the final-answer tokens
+    (~50–100/problem instead of ~12k).
     """
 
     def __init__(self, layer_module: nn.Module, layer_id: int, alpha: float,
@@ -407,6 +524,9 @@ class SteeringHook:
         self.enabled = True
         self.moves_phase_active = moves_phase_active
         self.fired = 0
+        # Per-instance debug print flag. Each hook instance prints once on
+        # its first call (so an α=0 sanity hook doesn't silence the α=20 one).
+        self._debug_printed_this_instance = False
         self.handle = layer_module.register_forward_hook(self._hook)
 
     def update_target(self, target_vec: torch.Tensor, mean_vec: torch.Tensor) -> None:
@@ -434,6 +554,7 @@ class SteeringHook:
         self.fired = 0
 
     def _hook(self, module, inputs, output):
+        global _STEERING_DEBUG_PRINTED
         if not self.enabled:
             return None
         h = output[0] if isinstance(output, tuple) else output
@@ -444,22 +565,49 @@ class SteeringHook:
             if not mask.any():
                 return None
             sv = self.steering_units_batched.to(device=h.device, dtype=h.dtype)
+            should_debug = (_STEERING_DEBUG_ENABLED
+                            and not self._debug_printed_this_instance
+                            and sv.numel() > 0)
+            if should_debug:
+                _hook_debug_dump(module, output, sv[0], self.alpha,
+                                 model_for_lookup=None)
+                self._debug_printed_this_instance = True
+                _STEERING_DEBUG_PRINTED = True  # keep global for back-compat
             delta = self.alpha * sv * mask.to(dtype=h.dtype).unsqueeze(-1)  # (B, H)
-            h[:, -1:, :] = h[:, -1:, :] + delta.unsqueeze(1)
+            # Clone-and-return: avoid any in-place ambiguity when the parent
+            # module's forward returns a bare Tensor (newer transformers).
+            new_h = h.clone()
+            new_h[:, -1:, :] = h[:, -1:, :] + delta.unsqueeze(1)
             self.fired += int(mask.sum().item())
+            if should_debug:
+                actual = float((new_h[:, -1:, :] - h[:, -1:, :]).float().norm())
+                print(f"[steer-debug] post-modify check: ‖new[-1] - old[-1]‖ = "
+                      f"{actual:.4f}  alpha={self.alpha}  layer={self.layer_id}")
             if isinstance(output, tuple):
-                return (h,) + output[1:]
-            return h
+                return (new_h,) + output[1:]
+            return new_h
 
         # Scalar / single-row path (legacy).
         if (not self.moves_phase_active or self.steering_unit is None):
             return None
         sv = self.steering_unit.to(device=h.device, dtype=h.dtype)
-        h[:, -1:, :] = h[:, -1:, :] + self.alpha * sv
+        should_debug = (_STEERING_DEBUG_ENABLED
+                        and not self._debug_printed_this_instance)
+        if should_debug:
+            _hook_debug_dump(module, output, sv, self.alpha)
+            self._debug_printed_this_instance = True
+            _STEERING_DEBUG_PRINTED = True  # keep global for back-compat
+        new_h = h.clone()
+        new_h[:, -1:, :] = h[:, -1:, :] + self.alpha * sv
         self.fired += 1
+        if should_debug:
+            actual = float((new_h[:, -1:, :] - h[:, -1:, :]).float().norm())
+            print(f"[steer-debug] post-modify check: ‖new[-1] - old[-1]‖ = "
+                  f"{actual:.4f}  alpha={self.alpha}  layer={self.layer_id}  "
+                  f"(if alpha>0 and this is 0, hook math is wrong)")
         if isinstance(output, tuple):
-            return (h,) + output[1:]
-        return h
+            return (new_h,) + output[1:]
+        return new_h
 
     def remove(self) -> None:
         self.handle.remove()
@@ -495,6 +643,12 @@ def _stop_token_ids(tokenizer) -> Set[int]:
 
 
 _MOVES_HEADER_RE = re.compile(r'moves\s*=\s*\[', re.IGNORECASE)
+# R1 emits a full <think>…</think> CoT before the final-answer block. The CoT
+# routinely contains speculative "moves = [(0, 0, 2), …]" fragments as the
+# model reasons. We must NOT activate the steering hook on those — only on the
+# post-think final-answer header. Gate the trigger on </think> having appeared
+# in the generation so far.
+_THINK_END_RE = re.compile(r'</think>', re.IGNORECASE)
 
 
 def generate_with_steering(
@@ -546,6 +700,7 @@ def generate_with_steering(
 
     moves_phase = always_steer
     moves_phase_step = -1
+    think_closed = always_steer  # if forcing steer-during-CoT, skip the gate
 
     generated_ids: List[int] = []
     cur_input = input_ids
@@ -564,14 +719,17 @@ def generate_with_steering(
             cur_input = torch.tensor([[next_id]], device=device)
 
             # ── Detect transition into the moves-output phase ────────────────
-            # Run only while hooks are still dormant; stop checking once flipped.
-            # A 32-token tail comfortably contains the ~8-char header.
+            # R1's CoT routinely contains speculative "moves = [..." fragments.
+            # First wait for </think> to close the CoT, THEN look for the real
+            # final-answer header in subsequent tokens.
             if hooks and not moves_phase:
                 tail = tokenizer.decode(
                     generated_ids[-min(32, len(generated_ids)):],
                     skip_special_tokens=False,
                 )
-                if _MOVES_HEADER_RE.search(tail):
+                if not think_closed and _THINK_END_RE.search(tail):
+                    think_closed = True
+                if think_closed and _MOVES_HEADER_RE.search(tail):
                     moves_phase = True
                     moves_phase_step = step
                     for h in hooks:
@@ -656,6 +814,7 @@ def generate_batched_with_steering(
     current_states = [tuple(int(x) for x in s) for s in start_states]
     moves_phase = [bool(always_steer)] * B
     moves_phase_step = [-1] * B
+    think_closed = [bool(always_steer)] * B  # per-row </think>-seen gate
     finished = [False] * B
     generated_ids_per_row: List[List[int]] = [[] for _ in range(B)]
     n_legal_total = [0] * B
@@ -741,10 +900,15 @@ def generate_batched_with_steering(
                         ids_b[-min(32, len(ids_b)):],
                         skip_special_tokens=False,
                     )
-                    if _MOVES_HEADER_RE.search(tail):
+                    if not think_closed[b] and _THINK_END_RE.search(tail):
+                        think_closed[b] = True
+                        print(f"    [gate] row {b}: </think> seen at step {step}")
+                    if think_closed[b] and _MOVES_HEADER_RE.search(tail):
                         moves_phase[b] = True
                         moves_phase_step[b] = step
                         phase_changed = True
+                        print(f"    [gate] row {b}: moves=[ opened at step {step} "
+                              f"→ steering ON")
 
                 if decode_every <= 1 or (step % decode_every == 0):
                     tail = tokenizer.decode(
@@ -898,25 +1062,65 @@ def run_condition(
 # ── Reporting & visualization ──────────────────────────────────────────────────
 
 def print_comparison_table(results: List[Dict[str, object]], n_states: int) -> None:
-    print("\n" + "=" * 96)
+    print("\n" + "=" * 116)
     print("COMPARISON TABLE")
-    print("=" * 96)
-    hdr = (f"{'Condition':<28} {'Layers':>10} {'α':>8} "
-           f"{'Solved':>8} {'Optimal':>8} {'Illegal':>8} {'Parse':>7} {'Wrong':>7}")
+    print("=" * 116)
+    hdr = (f"{'Condition':<28} {'Layers':>8} {'α':>7} "
+           f"{'Solved':>8} {'Optimal':>8} {'Illegal':>8} {'Parse':>7} {'Wrong':>7} "
+           f"{'≠ref':>7}")
     print(hdr)
-    print("-" * 96)
-    for r in results:
+    print("-" * 116)
+    # Pick the reference: first result with alpha=0.5 if present, else lowest
+    # non-None alpha. "≠ref" counts per-problem (category, sim_state) tuples
+    # that differ from the reference — i.e. how many problems higher α actually
+    # changed.
+    ref_idx = None
+    for i, r in enumerate(results):
+        a = r.get("alpha")
+        if isinstance(a, (int, float)) and abs(a - 0.5) < 1e-6:
+            ref_idx = i
+            break
+    if ref_idx is None:
+        non_none = [(i, r["alpha"]) for i, r in enumerate(results)
+                    if isinstance(r.get("alpha"), (int, float))]
+        if non_none:
+            ref_idx = min(non_none, key=lambda x: x[1])[0]
+    ref_per_prob: Dict[int, Tuple[str, Tuple[int, ...]]] = {}
+    if ref_idx is not None:
+        for rec in results[ref_idx]["per_problem"]:
+            ref_per_prob[int(rec["prob_idx"])] = (
+                rec.get("category", ""),
+                tuple(rec.get("sim_state", ())),
+            )
+
+    for i, r in enumerate(results):
         alpha_str = f"{r['alpha']:.3f}" if isinstance(r["alpha"], (int, float)) else "  -"
         layers_str = ",".join(str(l) for l in r["layer_ids"]) if r["layer_ids"] else "-"
         cc = r["category_counts"]
         wrong = (cc.get(WRONG_GOAL_STATE, 0) + cc.get(PREMATURE_STOP, 0)
                  + cc.get(EXCESSIVE_MOVES, 0))
-        print(f"{r['label']:<28} {layers_str:>10} {alpha_str:>8} "
+        if i == ref_idx or ref_idx is None:
+            diff_str = "  -"
+        else:
+            n_diff = sum(
+                1 for rec in r["per_problem"]
+                if (rec.get("category", ""), tuple(rec.get("sim_state", ())))
+                != ref_per_prob.get(int(rec["prob_idx"]), (None, None))
+            )
+            diff_str = f"{n_diff:>3d}/{n_states:<3d}"
+        print(f"{r['label']:<28} {layers_str:>8} {alpha_str:>7} "
               f"{r['n_solved']:>4d}/{n_states:<3d}  "
               f"{r['n_optimal']:>4d}/{n_states:<3d} "
               f"{r['n_illegal']:>4d}/{n_states:<3d} "
               f"{r['n_parse_error']:>3d}/{n_states:<3d} "
-              f"{wrong:>3d}/{n_states:<3d}")
+              f"{wrong:>3d}/{n_states:<3d} "
+              f"{diff_str:>7}")
+    if ref_idx is not None:
+        ref_alpha = results[ref_idx]["alpha"]
+        print(f"\n  '≠ref' = problems whose (category, sim_state) differs from "
+              f"α={ref_alpha} (the reference). Near-zero values across all rows "
+              f"mean higher α didn't change anything — same failure pattern as "
+              f"the L36 run.")
 
 
 def plot_flipped(
@@ -1077,6 +1281,24 @@ def main() -> None:
                     layer_ids.append(lid)
     print(f"[INFO] Steering layers (1-indexed): {layer_ids}")
 
+    # ── Flip global debug flag so the hook prints on its first call. ───
+    global _STEERING_DEBUG_ENABLED
+    _STEERING_DEBUG_ENABLED = bool(args.debug_steering)
+
+    # ── hidden_states.pt provenance check (always; cheap, critical) ────
+    hs_path = Path(args.hidden_states)
+    if not hs_path.exists():
+        raise FileNotFoundError(f"hidden_states not found: {hs_path}")
+    import hashlib, datetime as _dt
+    h = hashlib.md5()
+    with hs_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    mtime = _dt.datetime.fromtimestamp(hs_path.stat().st_mtime).isoformat(timespec="seconds")
+    print(f"[steer-startup] hidden_states.pt = {hs_path}")
+    print(f"[steer-startup]   md5={h.hexdigest()}  mtime={mtime}  "
+          f"size={hs_path.stat().st_size:,} bytes")
+
     print(f"[INFO] Loading position-A activations from {args.hidden_states}")
     layer_state_to_vec: Dict[int, Dict[State, torch.Tensor]] = {}
     layer_mean_vec: Dict[int, torch.Tensor] = {}
@@ -1092,7 +1314,244 @@ def main() -> None:
     print(f"[INFO] num_hidden_layers={int(cfg.num_hidden_layers)}  "
           f"hidden_size={int(cfg.hidden_size)}")
 
+    # ── Direction sanity + dim match against the model ─────────────────
+    primary_layer = layer_ids[0]
+    primary_stv = layer_state_to_vec[primary_layer]
+    primary_mv = layer_mean_vec[primary_layer]
+    sample_state = next(iter(primary_stv))
+    sample_diff = (primary_stv[sample_state] - primary_mv)
+    sample_norm = float(sample_diff.norm())
+    print(f"[steer-startup] model class = {type(raw_model).__name__}  "
+          f"hidden_size={int(cfg.hidden_size)}")
+    print(f"[steer-startup] direction (target-mean) at L{primary_layer}: "
+          f"shape={tuple(sample_diff.shape)}  dtype={sample_diff.dtype}  "
+          f"norm={sample_norm:.4f}  abs_mean={float(sample_diff.abs().mean()):.6f}")
+    if sample_norm < 0.1:
+        print("[steer-startup] ⚠ direction norm < 0.1 — vector looks near-zero. "
+              "Probably a stale hidden_states.pt (wrong model / corrupted).")
+    if sample_diff.shape[-1] != int(cfg.hidden_size):
+        raise RuntimeError(
+            f"DIRECTION DIM MISMATCH: hidden_states gives {sample_diff.shape[-1]} "
+            f"but model.config.hidden_size is {int(cfg.hidden_size)}. "
+            f"hidden_states.pt is from a different model — regenerate it."
+        )
+    # Layer module identity (catches off-by-one + wrong-sub-module bugs).
+    layers_list = get_layers_list(text_model)
+    target_module = layers_list[primary_layer - 1]
+    print(f"[steer-startup] layer index {primary_layer} (1-indexed) → "
+          f"{type(target_module).__name__} "
+          f"at depth {primary_layer}/{int(cfg.num_hidden_layers)} "
+          f"({100.0 * primary_layer / int(cfg.num_hidden_layers):.1f}% through net)")
+
     alphas = [float(x) for x in args.alphas.split(",") if x.strip()]
+
+    # ── Differential sanity: alpha=0 vs alpha=20 on one prompt ─────────
+    # If outputs are byte-identical we abort BEFORE the (expensive) sweep,
+    # because something downstream is silently swallowing the modification
+    # (most often: bf16 underflow, wrong tuple element, or non-returning hook).
+    if not args.skip_sanity:
+        print("\n[steer-startup] running α=0 vs α=20 differential test on "
+              f"state={states[0]} (this is the empty-vs-loud probe)…")
+        from_state = states[0]
+        sanity_prompt = build_prompt(tokenizer, from_state, 0, n_disks)
+        sanity_max_tokens = min(96, args.max_new_tokens)
+
+        def _sanity_one(alpha_val: float) -> Tuple[List[int], List[int]]:
+            hooks_local: List[SteeringHook] = []
+            for lid in layer_ids:
+                hk = SteeringHook(
+                    layers_list[lid - 1], lid, float(alpha_val),
+                    moves_phase_active=True,  # force-on for this test
+                )
+                hk.update_target(layer_state_to_vec[lid][from_state],
+                                 layer_mean_vec[lid])
+                hooks_local.append(hk)
+            try:
+                enc = tokenizer(sanity_prompt, return_tensors="pt",
+                                add_special_tokens=False)
+                input_ids = enc["input_ids"].to(device)
+                gen_ids: List[int] = []
+                cur = input_ids
+                past = None
+                with torch.no_grad():
+                    for _ in range(sanity_max_tokens):
+                        out = raw_model(input_ids=cur, past_key_values=past, use_cache=True)
+                        past = out.past_key_values
+                        nxt = int(out.logits[:, -1, :].argmax(dim=-1).item())
+                        gen_ids.append(nxt)
+                        if nxt in eos_ids:
+                            break
+                        cur = torch.tensor([[nxt]], device=device)
+                fired_counts = [hk.fired for hk in hooks_local]
+                return gen_ids, fired_counts
+            finally:
+                for hk in hooks_local:
+                    hk.remove()
+
+        ids_a0,  fired_a0  = _sanity_one(0.0)
+        ids_a20, fired_a20 = _sanity_one(20.0)
+        head_a0  = tokenizer.decode(ids_a0[:30],  skip_special_tokens=False)
+        head_a20 = tokenizer.decode(ids_a20[:30], skip_special_tokens=False)
+        print(f"[steer-startup]   α=0   fired per-layer: {fired_a0}")
+        print(f"[steer-startup]   α=0   first 30 tok ids: {ids_a0[:30]}")
+        print(f"[steer-startup]   α=0   decoded head: {head_a0!r}")
+        print(f"[steer-startup]   α=20  fired per-layer: {fired_a20}")
+        print(f"[steer-startup]   α=20  first 30 tok ids: {ids_a20[:30]}")
+        print(f"[steer-startup]   α=20  decoded head: {head_a20!r}")
+
+        same_20 = ids_a0 == ids_a20
+        if same_20:
+            # Identical at α=20 doesn't yet prove the hook is broken — R1's
+            # opener "Okay, so I have …" is extremely confident, and a 20-unit
+            # bump on a ~180-norm residual slice may not cross the argmax
+            # margin for the first ~30 tokens. Escalate to α=200 to
+            # disambiguate true no-op vs subthreshold perturbation.
+            print("[steer-startup] α=20 produced byte-identical tokens — "
+                  "escalating to α=200 to distinguish a broken hook from a "
+                  "subthreshold bump (R1 opens with very confident tokens).")
+            ids_a200, fired_a200 = _sanity_one(200.0)
+            head_a200 = tokenizer.decode(ids_a200[:30], skip_special_tokens=False)
+            print(f"[steer-startup]   α=200 fired per-layer: {fired_a200}")
+            print(f"[steer-startup]   α=200 first 30 tok ids: {ids_a200[:30]}")
+            print(f"[steer-startup]   α=200 decoded head: {head_a200!r}")
+            if ids_a0 == ids_a200:
+                raise RuntimeError(
+                    "Steering has no effect even at α=200 — hook is a no-op. "
+                    "fired_a200={} (zeros mean the hook never ran). Re-run "
+                    "with --debug_steering to see the [steer-debug] block for "
+                    "the α=200 sanity call.".format(fired_a200)
+                )
+            else:
+                print("[steer-startup] ✓ outputs DIFFER at α=200 — hook is "
+                      "functional. α=20 was simply below R1's argmax-flip "
+                      "threshold on the opener. Pick a larger production α "
+                      "or accept that early-token effects will be muted.")
+        else:
+            print("[steer-startup] ✓ outputs differ at α=20 — steering modifies the residual stream.")
+    else:
+        print("[steer-startup] --skip_sanity set; differential α=0/α=20 test skipped.")
+
+    # ── Gate-on diagnostic ─────────────────────────────────────────────────
+    # The existing sanity above runs the hook with moves_phase_active=True
+    # (force-on / gate OFF). That tests whether the layer is steerable in
+    # principle. But the production sweep gates the hook ON only AFTER
+    # </think>+moves=[, by which point thousands of tokens of KV cache may
+    # dominate attention. This second diagnostic generates one full sequence
+    # with the gate ON at α=0 and at α=200 and compares the first 30 post-
+    # gate tokens. If they're identical, the gate blocks the effect →
+    # cache-dominance is real and the sweep would waste compute.
+    if args.gate_on_sanity:
+        print(f"\n[steer-startup] GATE-ON differential test at L{primary_layer} "
+              f"(α=0 vs α=200, max_new_tokens={args.gate_sanity_max_tokens}). "
+              f"This generates two ~3-min sequences sequentially.")
+        gate_prompt = build_prompt(tokenizer, states[0], 0, n_disks)
+
+        def _gate_on_one(alpha_val: float) -> Tuple[List[int], int, int]:
+            """Generate with gate-on hook. Returns (gen_ids, gate_step, fired).
+            gate_step = step at which moves=[ triggered the hook, -1 if never."""
+            hooks_local: List[SteeringHook] = []
+            for lid in layer_ids:
+                hk = SteeringHook(
+                    layers_list[lid - 1], lid, float(alpha_val),
+                    moves_phase_active=False,  # ← GATE ON (dormant until trigger)
+                )
+                hk.update_target(layer_state_to_vec[lid][states[0]],
+                                 layer_mean_vec[lid])
+                hooks_local.append(hk)
+            try:
+                enc = tokenizer(gate_prompt, return_tensors="pt",
+                                add_special_tokens=False)
+                input_ids = enc["input_ids"].to(device)
+                gen_ids: List[int] = []
+                think_closed = False
+                gate_step = -1
+                cur = input_ids
+                past = None
+                with torch.no_grad():
+                    for step in range(args.gate_sanity_max_tokens):
+                        out = raw_model(input_ids=cur, past_key_values=past,
+                                        use_cache=True)
+                        past = out.past_key_values
+                        nxt = int(out.logits[:, -1, :].argmax(dim=-1).item())
+                        gen_ids.append(nxt)
+                        if nxt in eos_ids:
+                            break
+                        cur = torch.tensor([[nxt]], device=device)
+                        # Trigger detection — same two-stage gate as production.
+                        if gate_step < 0:
+                            tail = tokenizer.decode(
+                                gen_ids[-min(32, len(gen_ids)):],
+                                skip_special_tokens=False,
+                            )
+                            if not think_closed and _THINK_END_RE.search(tail):
+                                think_closed = True
+                            if think_closed and _MOVES_HEADER_RE.search(tail):
+                                gate_step = step
+                                for hk in hooks_local:
+                                    hk.activate_moves_phase()
+                fired = hooks_local[0].fired if hooks_local else 0
+                return gen_ids, gate_step, fired
+            finally:
+                for hk in hooks_local:
+                    hk.remove()
+
+        ids_g0, gate0, fired_g0 = _gate_on_one(0.0)
+        ids_g200, gate200, fired_g200 = _gate_on_one(200.0)
+
+        def _post_gate(ids: List[int], gate: int, n: int = 30) -> List[int]:
+            if gate < 0:
+                return []
+            return ids[gate: gate + n]
+
+        post0 = _post_gate(ids_g0, gate0)
+        post200 = _post_gate(ids_g200, gate200)
+        post0_text = tokenizer.decode(post0, skip_special_tokens=False) if post0 else "<gate never fired>"
+        post200_text = tokenizer.decode(post200, skip_special_tokens=False) if post200 else "<gate never fired>"
+        print(f"[steer-startup]   GATE-ON α=0   total_gen={len(ids_g0):5d}  "
+              f"gate_at={gate0}  fired={fired_g0}")
+        print(f"[steer-startup]   GATE-ON α=0   post-gate (first 30): {post0_text!r}")
+        print(f"[steer-startup]   GATE-ON α=200 total_gen={len(ids_g200):5d}  "
+              f"gate_at={gate200}  fired={fired_g200}")
+        print(f"[steer-startup]   GATE-ON α=200 post-gate (first 30): {post200_text!r}")
+
+        # Branch classification.
+        gate_on_differs = bool(post0) and bool(post200) and (post0 != post200)
+        # gate-off result from existing sanity: any α we tested that differed
+        # from α=0. ids_a20/ids_a200 are populated above; reconstruct here.
+        # If --skip_sanity was passed, we can't classify — bail with a message.
+        if args.skip_sanity:
+            print("[steer-startup] ⚠ --skip_sanity was set; cannot determine "
+                  "gate-off baseline. Skipping branch classification.")
+        else:
+            ids_a200_in_scope = ids_a200 if 'ids_a200' in dir() else ids_a20
+            gate_off_differs = (ids_a0 != ids_a200_in_scope)
+            if gate_off_differs and gate_on_differs:
+                print(f"[steer-startup] ✓ BRANCH 1: L{primary_layer} is steerable "
+                      f"AND gate-on still has an effect. Proceeding to full eval.")
+            elif gate_off_differs and not gate_on_differs:
+                print(f"[steer-startup] ⚠ BRANCH 2: L{primary_layer} is steerable "
+                      f"force-on but gate-on produces identical post-gate tokens. "
+                      f"This confirms KV-cache dominance — layer choice doesn't help.")
+                print(f"[steer-startup] Aborting BEFORE the {len(alphas)}-α sweep "
+                      f"to save compute. Re-run without --gate_on_sanity to force.")
+                sys.exit(2)
+            else:
+                # Try one more α at the escalation level.
+                esc = args.gate_sanity_escalate_alpha
+                print(f"[steer-startup] α=200 didn't move either gate-off or "
+                      f"gate-on. Retrying gate-on at α={esc}…")
+                ids_gE, gateE, fired_gE = _gate_on_one(esc)
+                postE = _post_gate(ids_gE, gateE)
+                postE_text = tokenizer.decode(postE, skip_special_tokens=False) if postE else "<gate never fired>"
+                print(f"[steer-startup]   GATE-ON α={esc} gate_at={gateE}  "
+                      f"fired={fired_gE}  post-gate (first 30): {postE_text!r}")
+                if post0 and postE and post0 != postE:
+                    print(f"[steer-startup] ✓ BRANCH 1 at α={esc}.")
+                else:
+                    print(f"[steer-startup] ✗ BRANCH 3: L{primary_layer} not "
+                          f"steerable at any α we tried (20, 200, {esc}). "
+                          f"Aborting.")
+                    sys.exit(2)
 
     results: List[Dict[str, object]] = []
     baseline_result: Optional[Dict[str, object]] = None

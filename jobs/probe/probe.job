@@ -1,0 +1,75 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --job-name=probe_toh_transformer
+#SBATCH --ntasks=1
+#SBATCH --time=04:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/probe_toh_transformer_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+# Defaults can be overridden at submission time, e.g.:
+# sbatch --export=ALL,CHECKPOINT_DIR=toh_transformer/checkpoints/n4,OUTPUT_ROOT=toh_transformer/probe jobs/probe/probe.job
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-toh_transformer/checkpoints/n4}
+N_DISKS=${N_DISKS:-4}
+OUTPUT_ROOT=${OUTPUT_ROOT:-toh_transformer/probe}
+DEVICE=${DEVICE:-cuda}
+EPOCHS=${EPOCHS:-2000}
+LR=${LR:-1e-3}
+
+export PYTHONUNBUFFERED=1
+
+echo "========== ToH Probe =========="
+echo "Repo: $REPO_ROOT"
+echo "Checkpoint dir: $CHECKPOINT_DIR"
+echo "N_DISKS: $N_DISKS"
+echo "OUTPUT_ROOT: $OUTPUT_ROOT"
+echo "DEVICE: $DEVICE"
+echo "EPOCHS: $EPOCHS"
+echo "LR: $LR"
+echo "Python: $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "==============================="
+
+if [[ ! -d "$CHECKPOINT_DIR" ]]; then
+  echo "Checkpoint directory not found: $CHECKPOINT_DIR" >&2
+  exit 1
+fi
+
+mkdir -p "$OUTPUT_ROOT"
+
+mapfile -t CHECKPOINTS < <(find "$CHECKPOINT_DIR" -maxdepth 1 -type f -name 'epoch_*.pt' | sort)
+
+if [[ ${#CHECKPOINTS[@]} -eq 0 ]]; then
+  echo "No intermediate checkpoints found in $CHECKPOINT_DIR" >&2
+  exit 1
+fi
+
+for ckpt in "${CHECKPOINTS[@]}"; do
+  ckpt_name=$(basename "$ckpt")
+  epoch_tag=$(echo "$ckpt_name" | sed -E 's/^epoch_([0-9]+)\.pt$/\1/')
+  output_dir="$OUTPUT_ROOT/output_${epoch_tag}"
+
+  echo "--- Running probe for $ckpt_name -> $output_dir ---"
+  python -u toh_transformer/probe.py \
+    --checkpoint "$ckpt" \
+    --n_disks "$N_DISKS" \
+    --output_dir "$output_dir" \
+    --device "$DEVICE" \
+    --epochs "$EPOCHS" \
+    --lr "$LR"
+done
+
+echo "Probe run completed for ${#CHECKPOINTS[@]} intermediate checkpoints."

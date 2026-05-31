@@ -1,0 +1,156 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_h100
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=200G
+#SBATCH --job-name=ds_r1_finetune
+#SBATCH --ntasks=1
+#SBATCH --time=72:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/finetune_deepseek_r1_qwen32b_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+# Override at submission time with:
+#   sbatch --export=ALL,REGIME=baseline,OUTPUT_DIR=runs/baseline,EPOCHS=1 \
+#          jobs/finetune_deepseek_r1_qwen32b.job
+#   sbatch --export=ALL,REGIME=augmented_steer,OUTPUT_DIR=runs/aug_L36_alpha5,\
+#                  BASELINE_CHECKPOINT=runs/baseline/final,\
+#                  STEERING_DIRECTIONS=runs/aug_L36/steering_directions.pt,\
+#                  LR=1e-4 \
+#          jobs/finetune_deepseek_r1_qwen32b.job
+REGIME=${REGIME:-baseline}                         # baseline | augmented_steer
+LORA_RANK=${LORA_RANK:-16}
+LORA_ALPHA=${LORA_ALPHA:-32}
+LORA_DROPOUT=${LORA_DROPOUT:-0.05}
+LR=${LR:-2e-4}
+WARMUP_STEPS=${WARMUP_STEPS:-100}
+EPOCHS=${EPOCHS:-1}
+PER_DEVICE_BS=${PER_DEVICE_BS:-2}
+GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}
+MAX_SEQ_LEN=${MAX_SEQ_LEN:-768}
+SEED=${SEED:-42}
+DATA_DIR=${DATA_DIR:-hanoi_data/}
+MODEL_ID=${MODEL_ID:-/scratch-shared/dpereira/deepseek-r1-qwen32b}
+OUTPUT_DIR=${OUTPUT_DIR:-runs/baseline}
+LOG_EVERY_STEPS=${LOG_EVERY_STEPS:-10}
+EVAL_EVERY_STEPS=${EVAL_EVERY_STEPS:-100}
+SAVE_EVERY_EPOCH=${SAVE_EVERY_EPOCH:-true}
+PROBE_LAYER=${PROBE_LAYER:-}                       # blank = use hardcoded PROBE_LAYER (36)
+BASELINE_CHECKPOINT=${BASELINE_CHECKPOINT:-}       # required when REGIME=augmented_steer
+STEERING_DIRECTIONS=${STEERING_DIRECTIONS:-}       # required when REGIME=augmented_steer
+HIDDEN_STATE_CACHE=${HIDDEN_STATE_CACHE:-}         # upstream per-state activation cache (input to steering_directions precompute)
+AUGMENTED_ALPHA=${AUGMENTED_ALPHA:-}               # augmented_steer only: override hardcoded α=5.0. Use 0.0 for plain-LoRA control.
+
+export PYTHONUNBUFFERED=1
+
+SCRATCH_DIR=${SCRATCH_DIR:-/scratch-shared/dpereira}
+mkdir -p "$SCRATCH_DIR"
+export HF_HOME=${HF_HOME:-$SCRATCH_DIR/hf_cache}
+export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$SCRATCH_DIR/transformers}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$SCRATCH_DIR/datasets}
+export TORCH_HOME=${TORCH_HOME:-$SCRATCH_DIR/torch_cache}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$SCRATCH_DIR/triton_cache}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$SCRATCH_DIR/cache}
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" \
+         "$TORCH_HOME" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME"
+
+echo "========== DeepSeek-R1-Qwen32B LoRA Fine-Tune =========="
+echo "REGIME:          $REGIME"
+echo "MODEL_ID:        $MODEL_ID"
+echo "LORA r/alpha:    $LORA_RANK / $LORA_ALPHA  (dropout $LORA_DROPOUT)"
+echo "LR:              $LR"
+echo "WARMUP_STEPS:    $WARMUP_STEPS"
+echo "EPOCHS:          $EPOCHS"
+echo "PER_DEVICE_BS:   $PER_DEVICE_BS"
+echo "GRAD_ACCUM:      $GRAD_ACCUM_STEPS"
+echo "MAX_SEQ_LEN:     $MAX_SEQ_LEN"
+echo "SEED:            $SEED"
+echo "DATA_DIR:        $DATA_DIR"
+echo "OUTPUT_DIR:      $OUTPUT_DIR"
+echo "LOG_EVERY:       $LOG_EVERY_STEPS"
+echo "EVAL_EVERY:      $EVAL_EVERY_STEPS"
+echo "SAVE_EVERY_EPOCH:$SAVE_EVERY_EPOCH"
+echo "Python:          $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "========================================================"
+
+mkdir -p "$OUTPUT_DIR"
+mkdir -p work
+
+# augmented_steer: precompute unit-norm steering directions once if missing.
+# Requires an upstream per-state activation cache; if HIDDEN_STATE_CACHE isn't
+# set we default to runs/canonical_steer_L36/hidden_states_by_state.pt (the
+# legacy path; same data, just the historic filename).
+if [[ "$REGIME" == "augmented_steer" ]]; then
+  if [[ -z "$STEERING_DIRECTIONS" ]]; then
+    echo "[ERROR] REGIME=augmented_steer requires STEERING_DIRECTIONS env var" >&2
+    exit 2
+  fi
+  if [[ -z "$BASELINE_CHECKPOINT" ]]; then
+    echo "[ERROR] REGIME=augmented_steer requires BASELINE_CHECKPOINT env var" >&2
+    exit 2
+  fi
+  HIDDEN_SRC="${HIDDEN_STATE_CACHE:-runs/canonical_steer_L36/hidden_states_by_state.pt}"
+  if [[ ! -f "$HIDDEN_SRC" ]]; then
+    echo "[augmented_steer] upstream activation cache missing → building it first: $HIDDEN_SRC"
+    mkdir -p "$(dirname "$HIDDEN_SRC")"
+    python -m finetune.precompute_canonical_states \
+      --baseline_checkpoint "$BASELINE_CHECKPOINT" \
+      --data_dir "$DATA_DIR" \
+      --output "$HIDDEN_SRC" \
+      --probe_layer "${PROBE_LAYER:-36}" \
+      --max_seq_len "$MAX_SEQ_LEN" \
+      --batch_size 4
+  fi
+  if [[ ! -f "$STEERING_DIRECTIONS" ]]; then
+    echo "[augmented_steer] directions cache missing → deriving from $HIDDEN_SRC"
+    mkdir -p "$(dirname "$STEERING_DIRECTIONS")"
+    python -m finetune.precompute_steering_directions \
+      --canonical_cache "$HIDDEN_SRC" \
+      --output "$STEERING_DIRECTIONS"
+  else
+    echo "[augmented_steer] reusing existing directions cache: $STEERING_DIRECTIONS"
+  fi
+fi
+
+CMD=(accelerate launch
+  --num_processes 1
+  --mixed_precision bf16
+  finetune/train.py
+    --regime "$REGIME"
+    --model_id "$MODEL_ID"
+    --lora_rank "$LORA_RANK"
+    --lora_alpha "$LORA_ALPHA"
+    --lora_dropout "$LORA_DROPOUT"
+    --lr "$LR"
+    --warmup_steps "$WARMUP_STEPS"
+    --epochs "$EPOCHS"
+    --per_device_batch_size "$PER_DEVICE_BS"
+    --grad_accum_steps "$GRAD_ACCUM_STEPS"
+    --max_seq_len "$MAX_SEQ_LEN"
+    --seed "$SEED"
+    --data_dir "$DATA_DIR"
+    --output_dir "$OUTPUT_DIR"
+    --log_every_steps "$LOG_EVERY_STEPS"
+    --eval_every_steps "$EVAL_EVERY_STEPS"
+    --save_every_epoch "$SAVE_EVERY_EPOCH"
+)
+[[ -n "$PROBE_LAYER"          ]]  && CMD+=(--probe_layer "$PROBE_LAYER")
+[[ -n "$BASELINE_CHECKPOINT"  ]]  && CMD+=(--baseline_checkpoint "$BASELINE_CHECKPOINT")
+[[ -n "$STEERING_DIRECTIONS"  ]]  && CMD+=(--steering_directions "$STEERING_DIRECTIONS")
+[[ -n "$AUGMENTED_ALPHA"      ]]  && CMD+=(--augmented_alpha "$AUGMENTED_ALPHA")
+
+"${CMD[@]}"
+
+echo "DeepSeek-R1-Qwen32B LoRA fine-tune ($REGIME) completed."

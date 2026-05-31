@@ -1,0 +1,55 @@
+#!/bin/bash
+#Set job requirements
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --partition=rome
+#SBATCH --job-name=agent
+#SBATCH --time=06:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/agent_%A.out  # Standard output (%A expands to job ID)
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd $REPO_ROOT
+
+# Load .env variables (including OPENROUTER_API_KEY)
+if [ -f "$REPO_ROOT/.env" ]; then
+	set -a
+	# shellcheck disable=SC1091
+	source "$REPO_ROOT/.env"
+	set +a
+fi
+
+if [ -z "$OPENROUTER_API_KEY" ]; then
+	echo "ERROR: OPENROUTER_API_KEY is not set. Check $REPO_ROOT/.env"
+	exit 1
+fi
+
+export NUM_PROBLEMS=30
+export DISK_RANGE="3 4 5"
+export PROBLEM_MODE=nonstandard
+export PYTHONUNBUFFERED=1
+
+MODELS=(
+	"deepseek/deepseek-r1-0528"
+	"moonshotai/kimi-k2-thinking"
+
+)
+
+for model in "${MODELS[@]}"; do
+	echo "=============================================================="
+	echo "Running agent with MODEL_NAME=${model}"
+	echo "Settings: NUM_PROBLEMS=${NUM_PROBLEMS}, DISK_RANGE=${DISK_RANGE}, PROBLEM_MODE=${PROBLEM_MODE}"
+	echo "=============================================================="
+
+	python -u agent/run_agent.py \
+		--model-name "${model}" \
+		--problem-mode "${PROBLEM_MODE}" \
+		--disks ${DISK_RANGE} \
+		--num-problems ${NUM_PROBLEMS}
+done

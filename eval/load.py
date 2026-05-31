@@ -1,11 +1,19 @@
-"""Load a fine-tuned checkpoint: base model + LoRA adapter + (optional) probe head."""
+"""Load a fine-tuned checkpoint: base model + LoRA adapter.
+
+Two checkpoint shapes are supported:
+  - baseline: local adapter/ dir.
+  - augmented_steer: local adapter/ dir + the train cfg records
+    {baseline_checkpoint, steering_directions, probe_layer}. The hook is
+    OFF at eval by default; run_eval can install it on --hook_on for the
+    diagnostic eval.
+"""
 
 from __future__ import annotations
 
 import json
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 
@@ -13,14 +21,12 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from finetune.probe import Probe  # noqa: E402
-
 
 def load_checkpoint(
     checkpoint_dir: str | Path,
     device: str = "cuda",
-) -> Tuple[object, object, Optional[Probe], dict]:
-    """Returns (tokenizer, model, probe_or_None, train_config_dict)."""
+) -> Tuple[object, object, dict]:
+    """Returns (tokenizer, model, train_config_dict)."""
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -57,20 +63,17 @@ def load_checkpoint(
     for p in model.parameters():
         p.requires_grad_(False)
 
-    probe: Optional[Probe] = None
-    if train_cfg.get("regime") == "probe":
-        probe_path = ckpt / "probe.pt"
-        if probe_path.exists():
-            sd = torch.load(probe_path, map_location="cpu")
-            probe = Probe(hidden_dim=train_cfg.get("hidden_dim", 5120))
-            probe.load_state_dict(sd)
-            probe.eval()
-            for p in probe.parameters():
-                p.requires_grad_(False)
-            target_device = next(model.parameters()).device
-            probe.to(device=target_device, dtype=torch.bfloat16)
-            print(f"[load] probe head loaded from {probe_path}")
-        else:
-            print(f"[load] WARN regime=probe but no probe.pt found in {ckpt}")
+    # augmented_steer: standalone LoRA adapter. The hook is OFF by default —
+    # caller can install it via the eval --hook_on flag. We stash the
+    # directions cache path so run_eval can install on demand.
+    if train_cfg.get("regime") == "augmented_steer":
+        model._augmented_info = {
+            "probe_layer": int(train_cfg.get("probe_layer") or 36),
+            "steering_directions_path": train_cfg.get("steering_directions"),
+            "baseline_checkpoint": train_cfg.get("baseline_checkpoint"),
+            "trained_alpha": 5.0,  # AUGMENTED_ALPHA — also recorded in train_cfg["constants"]
+        }
+        print(f"[load] augmented_steer: standalone LoRA adapter; hook OFF by "
+              f"default. Directions cache: {train_cfg.get('steering_directions')}")
 
-    return tokenizer, model, probe, train_cfg
+    return tokenizer, model, train_cfg

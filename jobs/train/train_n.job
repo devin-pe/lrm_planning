@@ -1,0 +1,58 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --job-name=train_toh_transformer_n
+#SBATCH --ntasks=1
+#SBATCH --time=24:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/train_toh_transformer_n_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+echo "========== ToH Transformer Mixed-n Training =========="
+echo "Repo: $REPO_ROOT"
+echo "Python: $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "======================================================"
+
+# Tune runtime knobs via env vars without editing this file again.
+BATCH_SIZE=${BATCH_SIZE:-2048}
+NUM_WORKERS=${NUM_WORKERS:-8}
+SEQ_EVAL_MAX_EXAMPLES=${SEQ_EVAL_MAX_EXAMPLES:-1024}
+SEQ_EVAL_MAX_TRAIN_EXAMPLES=${SEQ_EVAL_MAX_TRAIN_EXAMPLES:-256}
+SEQ_EVAL_INCLUDE_TRAIN=${SEQ_EVAL_INCLUDE_TRAIN:-1}
+
+SEQ_TRAIN_FLAG=()
+if [[ "$SEQ_EVAL_INCLUDE_TRAIN" == "1" ]]; then
+  SEQ_TRAIN_FLAG=(--seq_eval_include_train)
+fi
+
+python -u toh_transformer/train.py \
+  --n_disks 4 \
+  --train_n_disks 3 4 6 \
+  --test_n_disks 5 \
+  --val_ratio 0.15 \
+  --eval_every 5 \
+  --num_epochs 50 \
+  --batch_size "$BATCH_SIZE" \
+  --num_workers "$NUM_WORKERS" \
+  --seq_eval_max_examples "$SEQ_EVAL_MAX_EXAMPLES" \
+  --seq_eval_max_train_examples "$SEQ_EVAL_MAX_TRAIN_EXAMPLES" \
+  --lr 0.0096 \
+  --min_lr 0.00032 \
+  --save_every 5 \
+  --checkpoint_dir toh_transformer/checkpoints \
+  "${SEQ_TRAIN_FLAG[@]}"
+
+echo "Mixed-n training run completed."

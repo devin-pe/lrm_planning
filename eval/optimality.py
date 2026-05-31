@@ -22,10 +22,10 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from hanoi_data.template import N_DISKS, state_to_pegs  # noqa: E402
+from hanoi_data.template import state_to_pegs  # noqa: E402
 from planning import TowersOfHanoiSolver  # noqa: E402
 
-State = Tuple[int, int, int, int]
+State = Tuple[int, ...]
 Move2 = Tuple[int, int]
 
 
@@ -47,6 +47,7 @@ def simulate_moves(
       final_state       spec tuple, or None if final state is invalid
       had_illegal       True if any move was rejected
     """
+    n_disks = len(s_I)
     pegs = [list(p) for p in state_to_pegs(tuple(int(x) for x in s_I))]
     planning_moves: List[List[int]] = []
     had_illegal = False
@@ -81,7 +82,7 @@ def simulate_moves(
         planning_moves.append([actual_disk, fp, tp])
 
     # Convert pegs back to spec tuple for clarity.
-    spec = [0] * N_DISKS
+    spec = [0] * n_disks
     for p, peg_list in enumerate(pegs):
         for d in peg_list:
             spec[d - 1] = p
@@ -107,15 +108,18 @@ def classify_moves(
 
     solver = TowersOfHanoiSolver()
     optimal_path = solver.solve(
-        num_disks=N_DISKS,
+        num_disks=len(s_I_t),
         initial_state=state_to_pegs(s_I_t),
         goal_state=goal_pegs,
     )
     optimal_len = len(optimal_path) if optimal_path else 0
 
+    # 5-way split: distinguish "never emitted a moves=[…] block" from
+    # "emitted one but with an illegal move". The former typically means
+    # verbose CoT ran into max_new_tokens; the latter is a reasoning error.
     if moves is None:
         return {
-            "category": "Illegal",
+            "category": "Illegal_format",
             "n_moves": 0,
             "optimal_len": optimal_len,
             "final_state": list(s_I_t),
@@ -128,7 +132,7 @@ def classify_moves(
 
     solved = final_pegs == goal_pegs
     if had_illegal:
-        category = "Illegal"
+        category = "Illegal_moves"
     elif not solved:
         category = "Incorrect"
     elif len(planning_moves) == optimal_len:

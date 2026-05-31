@@ -1,0 +1,94 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_h100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=100G
+#SBATCH --job-name=ds_r1_eval
+#SBATCH --ntasks=1
+#SBATCH --time=12:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/eval_finetune_deepseek_r1_qwen32b_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+# Override at submission time, e.g.:
+#   sbatch --export=ALL,CHECKPOINT_DIR=runs/aug_L36_alpha5/final,OUTPUT_DIR=runs/aug_L36_alpha5/eval_n4,N_DISKS=4 \
+#          jobs/eval_finetune_deepseek_r1_qwen32b.job
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-runs/baseline/final}
+OUTPUT_DIR=${OUTPUT_DIR:-runs/baseline/eval}
+DATA_DIR=${DATA_DIR:-hanoi_data/}
+N_DISKS=${N_DISKS:-4}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-0}    # 0 → auto by n_disks (3→2048, 4→3072, 5→4096)
+EVAL_SUBSET_SIZE=${EVAL_SUBSET_SIZE:-500}
+PROBE_LAYERS=${PROBE_LAYERS:-24,36,48}
+CHECKPOINT_TYPE=${CHECKPOINT_TYPE:-auto}    # auto | baseline | augmented_steer
+BATCH_SIZE=${BATCH_SIZE:-8}
+SEED=${SEED:-42}
+SKIP_SOLVE=${SKIP_SOLVE:-0}
+SKIP_PROBE=${SKIP_PROBE:-0}
+HOOK_ON=${HOOK_ON:-0}                       # augmented_steer only: install hook at eval (diagnostic)
+ALPHA_OVERRIDE=${ALPHA_OVERRIDE:-}           # augmented_steer only: override α at eval time
+
+export PYTHONUNBUFFERED=1
+
+SCRATCH_DIR=${SCRATCH_DIR:-/scratch-shared/dpereira}
+mkdir -p "$SCRATCH_DIR"
+export HF_HOME=${HF_HOME:-$SCRATCH_DIR/hf_cache}
+export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$SCRATCH_DIR/transformers}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$SCRATCH_DIR/datasets}
+export TORCH_HOME=${TORCH_HOME:-$SCRATCH_DIR/torch_cache}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$SCRATCH_DIR/triton_cache}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$SCRATCH_DIR/cache}
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" \
+         "$TORCH_HOME" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME"
+
+echo "========== DeepSeek-R1-Qwen32B Fine-Tune Evaluation =========="
+echo "CHECKPOINT_DIR:    $CHECKPOINT_DIR"
+echo "OUTPUT_DIR:        $OUTPUT_DIR"
+echo "DATA_DIR:          $DATA_DIR"
+echo "N_DISKS:           $N_DISKS"
+echo "MAX_NEW_TOKENS:    $MAX_NEW_TOKENS  (0 = auto)"
+echo "EVAL_SUBSET_SIZE:  $EVAL_SUBSET_SIZE"
+echo "PROBE_LAYERS:      $PROBE_LAYERS"
+echo "BATCH_SIZE:        $BATCH_SIZE"
+echo "SEED:              $SEED"
+echo "SKIP solve/probe:  $SKIP_SOLVE/$SKIP_PROBE"
+echo "HOOK_ON:           $HOOK_ON   ALPHA_OVERRIDE: $ALPHA_OVERRIDE"
+echo "Python:            $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "==============================================================="
+
+mkdir -p "$OUTPUT_DIR"
+mkdir -p work
+
+CMD=(python -u -m eval.run_eval
+  --checkpoint_dir "$CHECKPOINT_DIR"
+  --output_dir "$OUTPUT_DIR"
+  --data_dir "$DATA_DIR"
+  --n_disks "$N_DISKS"
+  --max_new_tokens "$MAX_NEW_TOKENS"
+  --eval_subset_size "$EVAL_SUBSET_SIZE"
+  --probe_layers "$PROBE_LAYERS"
+  --checkpoint_type "$CHECKPOINT_TYPE"
+  --batch_size "$BATCH_SIZE"
+  --seed "$SEED"
+)
+
+[[ "$SKIP_SOLVE" == "1" ]] && CMD+=(--skip_solve)
+[[ "$SKIP_PROBE" == "1" ]] && CMD+=(--skip_probe)
+[[ "$HOOK_ON" == "1" ]] && CMD+=(--hook_on)
+[[ -n "$ALPHA_OVERRIDE" ]] && CMD+=(--alpha_override "$ALPHA_OVERRIDE")
+
+"${CMD[@]}"
+
+echo "Eval complete for checkpoint $CHECKPOINT_DIR."
