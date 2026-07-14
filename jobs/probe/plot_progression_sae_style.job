@@ -1,0 +1,29 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --job-name=probe_progression_sae_style
+#SBATCH --ntasks=1
+#SBATCH --time=0:30:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/probe_progression_sae_style_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+export PYTHONUNBUFFERED=1
+
+# Re-renders layer-5 probe-space maps for epochs 5/25/50 in the SAE-figure style
+# (nodes coloured by which peg holds the largest disk, no title, no legend). Activations
+# are extracted as in the original probe.py (dropout active) and the probe is retrained
+# per epoch, then Procrustes-aligned to the canonical upright Sierpinski layout.
+# Outputs to toh_transformer/probe/new_outputs/.
+python -u toh_transformer/probe/plot_progression_sae_style.py

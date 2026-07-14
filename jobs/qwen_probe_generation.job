@@ -25,7 +25,10 @@ cd "$REPO_ROOT"
 MODEL_NAME=${MODEL_NAME:-/scratch-shared/dpereira/qwen3.6-27b}
 N_DISKS=${N_DISKS:-4}
 GENERATED_TEXTS=${GENERATED_TEXTS:-outputs/qwen_probe/generated_texts.json}
-LAYERS=${LAYERS:-24,36,48}
+# Top-3 layers by distance-probe Spearman from the qwen_probe.py sweep
+# (job 24342157): layers 40/28/32 (0.9353/0.9350/0.9350). Note: layers 16-48
+# are all within ~0.0005 Spearman, so this band is effectively tied.
+LAYERS=${LAYERS:-28,32,40}
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen_probe_generation}
 DEVICE=${DEVICE:-cuda}
 DTYPE=${DTYPE:-bfloat16}

@@ -1,0 +1,84 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_h100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=120G
+#SBATCH --job-name=qwen36_probe_eval
+#SBATCH --ntasks=1
+#SBATCH --time=12:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/eval_probe_qwen36_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+# Probe-only evaluation of a fine-tuned Qwen3.6-27B LoRA adapter (no solve pass).
+# Override at submission time, e.g.:
+#   sbatch --export=ALL,CHECKPOINT_DIR=runs/qwen36_baseline_full/final,\
+#          OUTPUT_DIR=runs/qwen36_baseline_full/eval_probe_n4,N_DISKS=4,BATCH_SIZE=8 \
+#          jobs/eval_probe_qwen36.job
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-runs/qwen36_baseline_full/final}
+OUTPUT_DIR=${OUTPUT_DIR:-runs/qwen36_baseline_full/eval_probe_n4}
+DATA_DIR=${DATA_DIR:-hanoi_data/}
+N_DISKS=${N_DISKS:-4}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-0}            # 0 -> auto by n_disks (3->2048, 4->3072, 5->4096)
+EVAL_SUBSET_SIZE=${EVAL_SUBSET_SIZE:-500}
+PROBE_LAYERS=${PROBE_LAYERS:-24,36,48}
+CHECKPOINT_TYPE=${CHECKPOINT_TYPE:-auto}       # auto detects regime (baseline / alignment_loss)
+# Probe forward materialises all-layer hidden states over the full (prompt+gen) sequence,
+# so memory scales with batch x sequence length. probe_bs is batch_size//4 internally; we
+# pass a smaller batch at n=5 (longer sequences) to stay well under one 80GB H100.
+BATCH_SIZE=${BATCH_SIZE:-8}
+SEED=${SEED:-42}
+
+export PYTHONUNBUFFERED=1
+
+SCRATCH_DIR=${SCRATCH_DIR:-/scratch-shared/dpereira}
+mkdir -p "$SCRATCH_DIR"
+export HF_HOME=${HF_HOME:-$SCRATCH_DIR/hf_cache}
+export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$SCRATCH_DIR/transformers}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$SCRATCH_DIR/datasets}
+export TORCH_HOME=${TORCH_HOME:-$SCRATCH_DIR/torch_cache}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$SCRATCH_DIR/triton_cache}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$SCRATCH_DIR/cache}
+# Reduce fragmentation-driven OOM during the hidden-states forward.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" \
+         "$TORCH_HOME" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME"
+
+echo "========== Qwen3.6-27B Probe-Only Evaluation =========="
+echo "CHECKPOINT_DIR:    $CHECKPOINT_DIR"
+echo "OUTPUT_DIR:        $OUTPUT_DIR"
+echo "N_DISKS:           $N_DISKS"
+echo "MAX_NEW_TOKENS:    $MAX_NEW_TOKENS  (0 = auto)"
+echo "EVAL_SUBSET_SIZE:  $EVAL_SUBSET_SIZE"
+echo "PROBE_LAYERS:      $PROBE_LAYERS"
+echo "CHECKPOINT_TYPE:   $CHECKPOINT_TYPE"
+echo "BATCH_SIZE:        $BATCH_SIZE"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "======================================================="
+
+mkdir -p "$OUTPUT_DIR" work
+
+python -u -m eval.run_eval \
+  --checkpoint_dir "$CHECKPOINT_DIR" \
+  --output_dir "$OUTPUT_DIR" \
+  --data_dir "$DATA_DIR" \
+  --n_disks "$N_DISKS" \
+  --max_new_tokens "$MAX_NEW_TOKENS" \
+  --eval_subset_size "$EVAL_SUBSET_SIZE" \
+  --probe_layers "$PROBE_LAYERS" \
+  --checkpoint_type "$CHECKPOINT_TYPE" \
+  --batch_size "$BATCH_SIZE" \
+  --seed "$SEED" \
+  --skip_solve
+
+echo "Probe-only eval complete for $CHECKPOINT_DIR (n_disks=$N_DISKS)."

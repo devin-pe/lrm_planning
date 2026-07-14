@@ -1,0 +1,63 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --job-name=sep_steering
+#SBATCH --ntasks=1
+#SBATCH --time=16:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/sep_steering_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+# Defaults can be overridden at submission time, e.g.:
+# sbatch --export=ALL,CHECKPOINT=toh_transformer/checkpoints/n4/best.pt,LAYERS=4,5,6,ALPHAS=0.0,0.5,1.0,2.0,5.0,10.0,SEED=42 jobs/probe/sep_steering.job
+CHECKPOINT=${CHECKPOINT:-toh_transformer/checkpoints/n4/best.pt}
+N_DISKS=${N_DISKS:-4}
+OUTPUT_DIR=${OUTPUT_DIR:-toh_transformer/patching_output}
+DEVICE=${DEVICE:-cuda}
+LAYERS=${LAYERS:-4,5,6}
+ALPHAS=${ALPHAS:-0.0,0.5,1.0,2.0,5.0,10.0}
+FULL_RESIDUAL_RESULTS=${FULL_RESIDUAL_RESULTS:-toh_transformer/activation_patching_output/activation_patching_results.json}
+SEED=${SEED:-42}
+
+export PYTHONUNBUFFERED=1
+
+echo "======= ToH SEP Activation Steering (alpha sweep) ======="
+echo "Repo: $REPO_ROOT"
+echo "CHECKPOINT: $CHECKPOINT"
+echo "N_DISKS: $N_DISKS"
+echo "OUTPUT_DIR: $OUTPUT_DIR"
+echo "DEVICE: $DEVICE"
+echo "LAYERS: $LAYERS"
+echo "ALPHAS: $ALPHAS"
+echo "FULL_RESIDUAL_RESULTS: $FULL_RESIDUAL_RESULTS"
+echo "SEED: $SEED"
+echo "Python: $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "========================================================="
+
+mkdir -p "$OUTPUT_DIR"
+
+echo "--- Running SEP steering alpha sweep -> $OUTPUT_DIR ---"
+python -u toh_transformer/sep_steering.py \
+  --checkpoint "$CHECKPOINT" \
+  --n_disks "$N_DISKS" \
+  --output_dir "$OUTPUT_DIR" \
+  --device "$DEVICE" \
+  --layers "$LAYERS" \
+  --alphas "$ALPHAS" \
+  --full_residual_results "$FULL_RESIDUAL_RESULTS" \
+  --seed "$SEED"
+
+echo "SEP steering run completed."

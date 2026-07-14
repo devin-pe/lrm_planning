@@ -56,14 +56,22 @@ def stratified_subset(rows: List[Dict], n: int, seed: int) -> List[Dict]:
     for v in by_len.values():
         rng.shuffle(v)
     out: List[Dict] = []
+    leftovers: List[Dict] = []
     total = sum(len(v) for v in by_len.values())
     for L, bucket in by_len.items():
         # proportional allocation, at least 1 per stratum if non-empty
         take = max(1, round(len(bucket) * n / total)) if bucket else 0
+        take = min(take, len(bucket))
         out.extend(bucket[:take])
+        leftovers.extend(bucket[take:])
     if len(out) > n:
         rng.shuffle(out)
         out = out[:n]
+    elif len(out) < n and leftovers:
+        # per-stratum round() can leave the allocation short of n; top up to
+        # exactly n from the unused remainder (deterministic via rng).
+        rng.shuffle(leftovers)
+        out.extend(leftovers[: n - len(out)])
     return out
 
 

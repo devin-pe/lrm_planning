@@ -3,10 +3,10 @@
 #SBATCH --partition=gpu_h100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=12
-#SBATCH --mem=200G
+#SBATCH --mem=100G
 #SBATCH --job-name=qwen_steer
 #SBATCH --ntasks=1
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --output=/home/dpereira/lrm_planning/work/steer_qwen_%A.out
 
 set -euo pipefail
@@ -25,13 +25,13 @@ cd "$REPO_ROOT"
 MODEL_NAME=${MODEL_NAME:-/scratch-shared/dpereira/qwen3.6-27b}
 HIDDEN_STATES=${HIDDEN_STATES:-outputs/qwen_probe/hidden_states.pt}
 N_DISKS=${N_DISKS:-4}
-LAYER=${LAYER:-36}
+LAYER=${LAYER:-28}
 EXTRA_LAYERS=${EXTRA_LAYERS:-}
 ALPHAS=${ALPHAS:-0.5,1,2,5,10,20}
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen_steering}
 DEVICE=${DEVICE:-cuda}
 DTYPE=${DTYPE:-bfloat16}
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-13000}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-32000}
 N_PROBLEMS=${N_PROBLEMS:-81}
 SEED=${SEED:-42}
 PROBE_DIR=${PROBE_DIR:-outputs/qwen_probe}

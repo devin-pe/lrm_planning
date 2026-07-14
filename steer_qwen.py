@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", default="bfloat16",
                    choices=["float16", "bfloat16", "float32"])
-    p.add_argument("--max_new_tokens", type=int, default=13000)
+    p.add_argument("--max_new_tokens", type=int, default=32000)
     p.add_argument("--n_problems", type=int, default=81)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--probe_dir", default="outputs/qwen_probe",
@@ -378,10 +378,29 @@ def load_model_and_tokenizer(model_name: str, dtype: torch.dtype, device_str: st
         low_cpu_mem_usage=True,
         device_map="auto" if device_str == "cuda" else None,
     )
+    # Prefer FlashAttention-2 on GPU (large win at long context); fall back to
+    # the default attention if the flash-attn package isn't available.
+    if device_str == "cuda":
+        load_kw["attn_implementation"] = "flash_attention_2"
+
+    def _load(kw):
+        try:
+            return AutoModelForCausalLM.from_pretrained(model_name, **kw)
+        except (ValueError, KeyError, AttributeError):
+            return AutoModel.from_pretrained(model_name, **kw)
+
     try:
-        raw = AutoModelForCausalLM.from_pretrained(model_name, **load_kw)
-    except (ValueError, KeyError, AttributeError):
-        raw = AutoModel.from_pretrained(model_name, **load_kw)
+        raw = _load(load_kw)
+        if "attn_implementation" in load_kw:
+            print("[INFO] Using attn_implementation=flash_attention_2")
+    except (ImportError, ValueError, RuntimeError) as e:
+        if "attn_implementation" in load_kw:
+            print(f"[WARN] FlashAttention-2 unavailable ({e}); "
+                  "falling back to default attention.")
+            load_kw.pop("attn_implementation")
+            raw = _load(load_kw)
+        else:
+            raise
 
     if hasattr(raw, "model") and hasattr(raw.model, "language_model"):
         print("[INFO] VLM detected — using model.model.language_model")

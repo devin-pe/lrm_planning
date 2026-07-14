@@ -25,7 +25,10 @@ cd "$REPO_ROOT"
 MODEL_NAME=${MODEL_NAME:-/scratch-shared/dpereira/deepseek-r1-qwen32b}
 N_DISKS=${N_DISKS:-4}
 GENERATED_TEXTS=${GENERATED_TEXTS:-outputs/deepseek_r1_qwen32b_probe/generated_texts.json}
-LAYERS=${LAYERS:-24,36,48}
+# Top-3 layers by distance-probe Spearman from the deepseek probe.py sweep
+# (job 24342276): layers 8/44/32 (0.9361/0.9360/0.9359). Note: layers 4-48 are
+# all within ~0.002 Spearman, so this band is effectively tied.
+LAYERS=${LAYERS:-8,32,44}
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/deepseek_r1_qwen32b_probe_generation}
 DEVICE=${DEVICE:-cuda}
 DTYPE=${DTYPE:-bfloat16}

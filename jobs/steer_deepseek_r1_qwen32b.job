@@ -6,7 +6,7 @@
 #SBATCH --mem=100G
 #SBATCH --job-name=ds_r1_steer
 #SBATCH --ntasks=1
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --output=/home/dpereira/lrm_planning/work/steer_deepseek_r1_qwen32b_%A.out
 
 set -euo pipefail
@@ -27,7 +27,7 @@ HIDDEN_STATES=${HIDDEN_STATES:-outputs/deepseek_r1_qwen32b_probe/hidden_states.p
 N_DISKS=${N_DISKS:-4}
 LAYER=${LAYER:-36}
 EXTRA_LAYERS=${EXTRA_LAYERS:-}
-ALPHAS=${ALPHAS:-0.5,1,2,5,10}
+ALPHAS=${ALPHAS:-5,10}
 DEBUG_STEERING=${DEBUG_STEERING:-0}
 SKIP_SANITY=${SKIP_SANITY:-0}
 GATE_ON_SANITY=${GATE_ON_SANITY:-0}              # additional gate-on diagnostic

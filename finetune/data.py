@@ -128,13 +128,16 @@ class HanoiSFTDataset(Dataset):
             "attention_mask": attention_mask,
             "labels": labels,
             "supervised_positions": supervised_positions,
+            "example_id": idx,
         }
 
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Pad input_ids / attention_mask / labels to the batch max length, and
     flatten supervised_positions to a single list of (batch_idx, token_idx,
-    target_state) tuples.
+    target_state) tuples. `example_ids` preserves the dataset row idx per
+    batch slot — used by alignment_loss to look up the precomputed
+    h_baseline cache.
     """
     max_len = max(len(ex["input_ids"]) for ex in batch)
     input_ids = torch.zeros((len(batch), max_len), dtype=torch.long)
@@ -142,6 +145,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     labels = torch.full((len(batch), max_len), -100, dtype=torch.long)
 
     flat_sup: List[Tuple[int, int, State]] = []
+    example_ids: List[int] = []
     for bi, ex in enumerate(batch):
         L = len(ex["input_ids"])
         input_ids[bi, :L] = torch.tensor(ex["input_ids"], dtype=torch.long)
@@ -149,17 +153,24 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         labels[bi, :L] = torch.tensor(ex["labels"], dtype=torch.long)
         for ti, target in ex["supervised_positions"]:
             flat_sup.append((bi, ti, target))
+        example_ids.append(int(ex.get("example_id", -1)))
 
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
         "supervised_positions": flat_sup,
+        "example_ids": example_ids,
     }
 
 
-def make_datasets(data_dir: Path, tokenizer, max_seq_len: int):
+def make_datasets(
+    data_dir: Path, tokenizer, max_seq_len: int,
+    train_file: str = "train.jsonl",
+):
+    """Default loads `train.jsonl` + `test.jsonl`. Pass `train_file` to point
+    at a different training set (e.g. `train_multi_puzzle.jsonl`)."""
     data_dir = Path(data_dir)
-    train = HanoiSFTDataset(data_dir / "train.jsonl", tokenizer, max_seq_len)
+    train = HanoiSFTDataset(data_dir / train_file, tokenizer, max_seq_len)
     test = HanoiSFTDataset(data_dir / "test.jsonl", tokenizer, max_seq_len)
     return train, test

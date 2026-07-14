@@ -2,10 +2,11 @@
 
 Two loss types are supported:
   - baseline: plain LM loss, fresh LoRA on top of the base model.
-  - augmented_steer: continue a baseline LoRA with a fixed-α steering bump
-    applied at L36 supervised anchors during training (hook OFF at inference).
-    All augmented_steer hyperparameters except α and the cache paths are
-    hardcoded at the top of finetune/train.py.
+  - alignment_loss: fresh LoRA on all layers; LM loss flows everywhere, but
+    an auxiliary alignment loss restricted to a band of mid-layers (default
+    L30-L42) pulls each supervised-position activation toward a target
+    (h_baseline + α · direction[L][state]). Strict band-gradient mechanism
+    via a second band-only forward pass on a detached pre-band activation.
 """
 
 from __future__ import annotations
@@ -43,14 +44,27 @@ class Config:
     log_every_steps: int = 10
     eval_every_steps: int = 100
     hidden_dim: int = HIDDEN_DIM
-    probe_layer: Optional[int] = None  # if set, overrides PROBE_LAYER in train.py
-    # augmented_steer only: path to existing LoRA-baseline ckpt to load + continue.
-    baseline_checkpoint: Optional[str] = None
-    # augmented_steer only: path to precomputed unit-norm steering directions.
-    steering_directions: Optional[str] = None
-    # augmented_steer only: override the hardcoded α (e.g. 0 for a control
-    # run = plain LoRA continuation).
-    augmented_alpha: Optional[float] = None
+    # Override the training-data filename inside data_dir (default `train.jsonl`).
+    # Pass `train_multi_puzzle.jsonl` to use the chained-puzzle augmented data.
+    train_file: str = "train.jsonl"
+    # Stop after this many global steps regardless of epoch count. 0 = unused.
+    # Set to e.g. 648 to match the original baseline budget on a larger dataset.
+    max_steps: int = 0
+
+    # ── alignment_loss only ────────────────────────────────────────────────
+    # CSV of layer indices that receive alignment-loss gradient.
+    alignment_band: str = "30,31,32,33,34,35,36,37,38,39,40,41,42"
+    # Scaling on the (h_target - h_global_mean) direction. Direction is NOT
+    # unit-norm; expect raw magnitudes 50-100 in bf16. Start with α ≈ 1.0
+    # then sweep down to 0.1-0.2 if the target is too far from baseline.
+    alpha_alignment: float = 1.0
+    # End-of-warmup λ weight on the alignment loss term in total = lm + λ·align.
+    lambda_alignment_target: float = 0.10
+    # Fraction of total steps over which λ ramps linearly from 0 to target.
+    lambda_warmup_frac: float = 0.20
+    # Paths to the two precompute outputs (precompute_alignment.py).
+    centroids_cache: Optional[str] = None      # state_centroids.pt
+    h_baseline_cache: Optional[str] = None     # h_baseline_supervised.pt
 
 
 def _str2bool(v: str) -> bool:
@@ -66,14 +80,16 @@ def _str2bool(v: str) -> bool:
 def parse_args(argv: Optional[list] = None) -> Config:
     p = argparse.ArgumentParser(description="LoRA fine-tune for ToH")
     # --regime is the legacy flag; --loss_type is preferred. Both write to cfg.regime.
-    p.add_argument("--regime", choices=["baseline", "augmented_steer"],
+    p.add_argument("--regime",
+                   choices=["baseline", "alignment_loss"],
                    required=False, default=None)
-    p.add_argument("--loss_type", choices=["baseline", "augmented_steer"],
+    p.add_argument("--loss_type",
+                   choices=["baseline", "alignment_loss"],
                    required=False, default=None,
                    help="baseline = LM only; "
-                        "augmented_steer = continue baseline LoRA with a fixed "
-                        "steering bump at L36 anchors during training (hook OFF "
-                        "at inference).")
+                        "alignment_loss = fresh LoRA on all layers, LM loss "
+                        "everywhere + band-restricted alignment loss at "
+                        "ALIGNMENT_BAND supervised anchors (no hook at inference).")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--model_id", default=MODEL_ID)
     p.add_argument("--lora_rank", type=int, default=16)
@@ -91,30 +107,35 @@ def parse_args(argv: Optional[list] = None) -> Config:
     p.add_argument("--save_every_epoch", type=_str2bool, default=True)
     p.add_argument("--log_every_steps", type=int, default=10)
     p.add_argument("--eval_every_steps", type=int, default=100)
-    p.add_argument("--probe_layer", type=int, default=None,
-                   help="Override the hardcoded PROBE_LAYER for layer ablation.")
-    p.add_argument("--baseline_checkpoint", default=None,
-                   help="(augmented_steer) path to baseline LoRA ckpt "
-                        "(e.g. runs/baseline/final). LoRA continues training "
-                        "from these weights.")
-    p.add_argument("--steering_directions", default=None,
-                   help="(augmented_steer) path to precomputed unit-norm "
-                        "{state_tuple → direction_5120} dict + global_mean. "
-                        "Build it with "
-                        "`python -m finetune.precompute_steering_directions ...`.")
-    p.add_argument("--augmented_alpha", type=float, default=None,
-                   help="(augmented_steer) override the hardcoded α=5.0. "
-                        "Set to 0.0 for a plain-LoRA-continuation control.")
+    p.add_argument("--train_file", default="train.jsonl",
+                   help="Training data filename inside --data_dir.")
+    p.add_argument("--max_steps", type=int, default=0,
+                   help="Hard cap on global training steps. 0 = unused.")
+    p.add_argument("--alignment_band",
+                   default="30,31,32,33,34,35,36,37,38,39,40,41,42",
+                   help="(alignment_loss) CSV of layer indices that receive "
+                        "alignment-loss gradient.")
+    p.add_argument("--alpha_alignment", type=float, default=1.0,
+                   help="(alignment_loss) scale on direction vector (NOT unit-norm).")
+    p.add_argument("--lambda_alignment_target", type=float, default=0.10,
+                   help="(alignment_loss) end-of-warmup λ weight on alignment loss.")
+    p.add_argument("--lambda_warmup_frac", type=float, default=0.20,
+                   help="(alignment_loss) fraction of total steps for linear λ warmup.")
+    p.add_argument("--centroids_cache", default=None,
+                   help="(alignment_loss) path to state_centroids.pt "
+                        "(precompute_alignment.py output).")
+    p.add_argument("--h_baseline_cache", default=None,
+                   help="(alignment_loss) path to h_baseline_supervised.pt "
+                        "(precompute_alignment.py output).")
     args = p.parse_args(argv)
     chosen = args.loss_type or args.regime
     if chosen is None:
-        p.error("must pass --loss_type {baseline|augmented_steer}")
-    if chosen == "augmented_steer":
-        if not args.baseline_checkpoint:
-            p.error("--loss_type=augmented_steer requires --baseline_checkpoint")
-        if not args.steering_directions:
-            p.error("--loss_type=augmented_steer requires --steering_directions "
-                    "(precompute it first)")
+        p.error("must pass --loss_type {baseline|alignment_loss}")
+    if chosen == "alignment_loss":
+        if not args.centroids_cache:
+            p.error("--loss_type=alignment_loss requires --centroids_cache")
+        if not args.h_baseline_cache:
+            p.error("--loss_type=alignment_loss requires --h_baseline_cache")
     args.regime = chosen
     del args.loss_type
     return Config(**vars(args))

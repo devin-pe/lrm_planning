@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --partition=gpu_a100       
 #SBATCH --gres=gpu:1                  
-#SBATCH -t 03:00:00
-#SBATCH --mem=64G
+#SBATCH -t 05:00:00
+#SBATCH --mem=96G
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name=install_flash_attn
 #SBATCH --output=/home/dpereira/lrm_planning/work/install_flash_attn_%A.out
@@ -25,8 +25,9 @@ nvcc --version
 echo "Checking PyTorch CUDA version..."
 python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA version: {torch.version.cuda}')"
 
-# Install dependencies for flash-attention (including wheel)
-pip install --upgrade pip wheel packaging ninja einops setuptools
+# Install dependencies for flash-attention (including wheel).
+# Pin setuptools <81 to stay compatible with vllm (requires setuptools<81,>=77.0.3).
+pip install --upgrade pip wheel packaging ninja einops 'setuptools>=77.0.3,<81.0.0'
 
 # Clone and build flash-attention
 cd /home/dpereira/lrm_planning
@@ -37,12 +38,15 @@ git clone https://github.com/Dao-AILab/flash-attention
 cd flash-attention
 
 # Build and install (this takes a while)
-# Use --no-build-isolation so it can find torch in the environment
+# Use --no-build-isolation so it can find torch in the environment.
+# MAX_JOBS=4 keeps peak memory down — MAX_JOBS=8 previously OOM-killed the build.
 echo "Building flash-attention..."
-MAX_JOBS=8 pip install . --no-build-isolation
+MAX_JOBS=4 pip install . --no-build-isolation
 
-# Test the installation
+# Test the installation from OUTSIDE the source tree, otherwise `import flash_attn`
+# resolves to ./flash_attn (source, no compiled extension) instead of the installed package.
 echo "Testing flash-attention installation..."
-python -c "import flash_attn; print(f'Flash Attention version: {flash_attn.__version__}')"
+cd /tmp
+python -c "import flash_attn; import flash_attn_2_cuda; print(f'Flash Attention version: {flash_attn.__version__} (cuda ext OK)')"
 
 echo "Installation complete!"

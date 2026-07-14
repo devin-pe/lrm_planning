@@ -6,7 +6,7 @@
 #SBATCH --mem=200G
 #SBATCH --job-name=ds_r1_finetune
 #SBATCH --ntasks=1
-#SBATCH --time=72:00:00
+#SBATCH --time=8:00:00
 #SBATCH --output=/home/dpereira/lrm_planning/work/finetune_deepseek_r1_qwen32b_%A.out
 
 set -euo pipefail
@@ -50,6 +50,14 @@ BASELINE_CHECKPOINT=${BASELINE_CHECKPOINT:-}       # required when REGIME=augmen
 STEERING_DIRECTIONS=${STEERING_DIRECTIONS:-}       # required when REGIME=augmented_steer
 HIDDEN_STATE_CACHE=${HIDDEN_STATE_CACHE:-}         # upstream per-state activation cache (input to steering_directions precompute)
 AUGMENTED_ALPHA=${AUGMENTED_ALPHA:-}               # augmented_steer only: override hardcoded α=5.0. Use 0.0 for plain-LoRA control.
+TRAIN_FILE=${TRAIN_FILE:-}                          # alt training data file inside DATA_DIR (e.g. train_multi_puzzle.jsonl)
+LAMBDA_ANTI_EOS=${LAMBDA_ANTI_EOS:-}                # weight on anti-EOS auxiliary loss (0 = disabled)
+MAX_STEPS=${MAX_STEPS:-}                            # hard cap on training steps (e.g. 648)
+N_MULTI=${N_MULTI:-8000}                            # if generating multi-puzzle, target count
+MULTI_MIX=${MULTI_MIX:-0.6,0.3,0.1}                 # 1-/2-/3-puzzle mix
+MULTI_LAYER=${MULTI_LAYER:-0}                       # 1 → run augmented_steer at multiple layers (default 24,36,48)
+MULTI_LAYER_LIST=${MULTI_LAYER_LIST:-24,36,48}      # csv of layer ids when MULTI_LAYER=1
+MULTI_LAYER_DIR=${MULTI_LAYER_DIR:-runs/aug_multi_layer}  # where the per-layer caches live
 
 export PYTHONUNBUFFERED=1
 
@@ -88,39 +96,96 @@ echo "========================================================"
 mkdir -p "$OUTPUT_DIR"
 mkdir -p work
 
-# augmented_steer: precompute unit-norm steering directions once if missing.
-# Requires an upstream per-state activation cache; if HIDDEN_STATE_CACHE isn't
-# set we default to runs/canonical_steer_L36/hidden_states_by_state.pt (the
-# legacy path; same data, just the historic filename).
-if [[ "$REGIME" == "augmented_steer" ]]; then
-  if [[ -z "$STEERING_DIRECTIONS" ]]; then
-    echo "[ERROR] REGIME=augmented_steer requires STEERING_DIRECTIONS env var" >&2
-    exit 2
+# Multi-puzzle data: if TRAIN_FILE points at a non-existent file inside
+# DATA_DIR, build it via the multi-puzzle generator. ~30 sec for 8k examples.
+if [[ -n "$TRAIN_FILE" && "$TRAIN_FILE" != "train.jsonl" ]]; then
+  TRAIN_PATH="${DATA_DIR%/}/$TRAIN_FILE"
+  if [[ ! -f "$TRAIN_PATH" ]]; then
+    echo "[multi-puzzle] $TRAIN_PATH missing → generating $N_MULTI examples"
+    python -m hanoi_data.generate_multi_puzzle \
+      --output "$TRAIN_PATH" \
+      --n_examples "$N_MULTI" \
+      --n_disks 4 \
+      --mix "$MULTI_MIX"
+  else
+    echo "[multi-puzzle] reusing existing $TRAIN_PATH"
   fi
+fi
+
+# augmented_steer: precompute unit-norm steering directions once if missing.
+# Two modes:
+#   - Single-layer (default): one cache at $STEERING_DIRECTIONS
+#   - Multi-layer (MULTI_LAYER=1): one cache per layer in $MULTI_LAYER_LIST
+if [[ "$REGIME" == "augmented_steer" ]]; then
   if [[ -z "$BASELINE_CHECKPOINT" ]]; then
     echo "[ERROR] REGIME=augmented_steer requires BASELINE_CHECKPOINT env var" >&2
     exit 2
   fi
-  HIDDEN_SRC="${HIDDEN_STATE_CACHE:-runs/canonical_steer_L36/hidden_states_by_state.pt}"
-  if [[ ! -f "$HIDDEN_SRC" ]]; then
-    echo "[augmented_steer] upstream activation cache missing → building it first: $HIDDEN_SRC"
-    mkdir -p "$(dirname "$HIDDEN_SRC")"
-    python -m finetune.precompute_canonical_states \
-      --baseline_checkpoint "$BASELINE_CHECKPOINT" \
-      --data_dir "$DATA_DIR" \
-      --output "$HIDDEN_SRC" \
-      --probe_layer "${PROBE_LAYER:-36}" \
-      --max_seq_len "$MAX_SEQ_LEN" \
-      --batch_size 4
-  fi
-  if [[ ! -f "$STEERING_DIRECTIONS" ]]; then
-    echo "[augmented_steer] directions cache missing → deriving from $HIDDEN_SRC"
-    mkdir -p "$(dirname "$STEERING_DIRECTIONS")"
-    python -m finetune.precompute_steering_directions \
-      --canonical_cache "$HIDDEN_SRC" \
-      --output "$STEERING_DIRECTIONS"
+  if [[ "$MULTI_LAYER" == "1" ]]; then
+    echo "[augmented_steer] MULTI-LAYER mode: layers=$MULTI_LAYER_LIST  dir=$MULTI_LAYER_DIR"
+    mkdir -p "$MULTI_LAYER_DIR"
+    STEERING_DIRECTIONS_MULTI=""
+    IFS=',' read -ra LAYERS <<< "$MULTI_LAYER_LIST"
+    for L in "${LAYERS[@]}"; do
+      LAYER_DIR="${MULTI_LAYER_DIR}/L${L}"
+      mkdir -p "$LAYER_DIR"
+      HIDDEN_SRC_L="${LAYER_DIR}/hidden_states_by_state.pt"
+      DIRS_L="${LAYER_DIR}/steering_directions.pt"
+      if [[ ! -f "$HIDDEN_SRC_L" ]]; then
+        echo "[augmented_steer] L${L}: precomputing activations → $HIDDEN_SRC_L"
+        python -m finetune.precompute_canonical_states \
+          --baseline_checkpoint "$BASELINE_CHECKPOINT" \
+          --data_dir "$DATA_DIR" \
+          --train_file "${TRAIN_FILE:-train.jsonl}" \
+          --output "$HIDDEN_SRC_L" \
+          --probe_layer "$L" \
+          --max_seq_len "$MAX_SEQ_LEN" \
+          --batch_size 4
+      else
+        echo "[augmented_steer] L${L}: reusing $HIDDEN_SRC_L"
+      fi
+      if [[ ! -f "$DIRS_L" ]]; then
+        echo "[augmented_steer] L${L}: deriving directions → $DIRS_L"
+        python -m finetune.precompute_steering_directions \
+          --canonical_cache "$HIDDEN_SRC_L" \
+          --output "$DIRS_L"
+      else
+        echo "[augmented_steer] L${L}: reusing $DIRS_L"
+      fi
+      if [[ -z "$STEERING_DIRECTIONS_MULTI" ]]; then
+        STEERING_DIRECTIONS_MULTI="$DIRS_L"
+      else
+        STEERING_DIRECTIONS_MULTI="${STEERING_DIRECTIONS_MULTI}:${DIRS_L}"
+      fi
+    done
+    echo "[augmented_steer] MULTI-LAYER paths: $STEERING_DIRECTIONS_MULTI"
   else
-    echo "[augmented_steer] reusing existing directions cache: $STEERING_DIRECTIONS"
+    if [[ -z "$STEERING_DIRECTIONS" ]]; then
+      echo "[ERROR] REGIME=augmented_steer requires STEERING_DIRECTIONS env var" >&2
+      exit 2
+    fi
+    HIDDEN_SRC="${HIDDEN_STATE_CACHE:-runs/canonical_steer_L36/hidden_states_by_state.pt}"
+    if [[ ! -f "$HIDDEN_SRC" ]]; then
+      echo "[augmented_steer] upstream activation cache missing → $HIDDEN_SRC"
+      mkdir -p "$(dirname "$HIDDEN_SRC")"
+      python -m finetune.precompute_canonical_states \
+        --baseline_checkpoint "$BASELINE_CHECKPOINT" \
+        --data_dir "$DATA_DIR" \
+        --train_file "${TRAIN_FILE:-train.jsonl}" \
+        --output "$HIDDEN_SRC" \
+        --probe_layer "${PROBE_LAYER:-36}" \
+        --max_seq_len "$MAX_SEQ_LEN" \
+        --batch_size 4
+    fi
+    if [[ ! -f "$STEERING_DIRECTIONS" ]]; then
+      echo "[augmented_steer] directions cache missing → $STEERING_DIRECTIONS"
+      mkdir -p "$(dirname "$STEERING_DIRECTIONS")"
+      python -m finetune.precompute_steering_directions \
+        --canonical_cache "$HIDDEN_SRC" \
+        --output "$STEERING_DIRECTIONS"
+    else
+      echo "[augmented_steer] reusing $STEERING_DIRECTIONS"
+    fi
   fi
 fi
 
@@ -150,6 +215,13 @@ CMD=(accelerate launch
 [[ -n "$BASELINE_CHECKPOINT"  ]]  && CMD+=(--baseline_checkpoint "$BASELINE_CHECKPOINT")
 [[ -n "$STEERING_DIRECTIONS"  ]]  && CMD+=(--steering_directions "$STEERING_DIRECTIONS")
 [[ -n "$AUGMENTED_ALPHA"      ]]  && CMD+=(--augmented_alpha "$AUGMENTED_ALPHA")
+[[ -n "$TRAIN_FILE"           ]]  && CMD+=(--train_file "$TRAIN_FILE")
+[[ -n "$LAMBDA_ANTI_EOS"      ]]  && CMD+=(--lambda_anti_eos "$LAMBDA_ANTI_EOS")
+[[ -n "$MAX_STEPS"            ]]  && CMD+=(--max_steps "$MAX_STEPS")
+if [[ "$MULTI_LAYER" == "1" ]]; then
+  CMD+=(--probe_layers "$MULTI_LAYER_LIST")
+  CMD+=(--steering_directions_multi "$STEERING_DIRECTIONS_MULTI")
+fi
 
 "${CMD[@]}"
 

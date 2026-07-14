@@ -868,12 +868,87 @@ def average_vectors_by_state(
     return out, counts
 
 
+# Canonical Sierpinski corners (largest disk = last state index) for the progression-style
+# rotation: largest disk on peg 1 -> apex (blue on top), matching the epoch 5/25/50 panels.
+_PROG_CORNERS = {1: (0.0, 1.0), 0: (0.8660254, -0.5), 2: (-0.8660254, -0.5)}
+
+
+def _prog_canonical_layout(states: Sequence[State]) -> np.ndarray:
+    pts = []
+    for s in states:
+        n = len(s)
+        x = y = 0.0
+        for i, peg in enumerate(s):
+            w = 0.5 ** (n - 1 - i)  # largest disk (last index) dominates
+            cx, cy = _PROG_CORNERS[peg]
+            x += w * cx
+            y += w * cy
+        pts.append((x, y))
+    return np.asarray(pts, dtype=np.float64)
+
+
+def _prog_procrustes(P: np.ndarray, Q: np.ndarray) -> np.ndarray:
+    """Rotate/reflect and uniformly scale P (centered) to best match Q."""
+    Pc = P - P.mean(axis=0, keepdims=True)
+    Qc = Q - Q.mean(axis=0, keepdims=True)
+    U, S, Vt = np.linalg.svd(Pc.T @ Qc)
+    R = U @ Vt
+    scale = S.sum() / (Pc ** 2).sum()
+    return scale * (Pc @ R)
+
+
+def plot_progression_style_raw_sep(
+    states: Sequence[State],
+    edges: Sequence[Tuple[int, int]],
+    coords: np.ndarray,
+    out_path: Path,
+) -> None:
+    """Render the raw-SEP probe in the epoch-progression style (rotated upright, framed,
+    legend, +1 labels) so it can be dropped in as the epoch-50 panel of that figure."""
+    aligned = _prog_procrustes(coords, _prog_canonical_layout(states))
+    pad = 0.08 * (aligned.max(axis=0) - aligned.min(axis=0))
+    xlim = (aligned[:, 0].min() - pad[0], aligned[:, 0].max() + pad[0])
+    ylim = (aligned[:, 1].min() - pad[1], aligned[:, 1].max() + pad[1])
+
+    peg_colors = {0: "red", 1: "blue", 2: "green"}
+    largest_disk_peg = np.array([s[-1] for s in states], dtype=np.int64)
+
+    fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
+    for i, j in edges:
+        ax.plot(
+            [aligned[i, 0], aligned[j, 0]],
+            [aligned[i, 1], aligned[j, 1]],
+            color="gray", linewidth=0.8, alpha=0.5, zorder=1,
+        )
+    for peg in (0, 1, 2):
+        mask = largest_disk_peg == peg
+        ax.scatter(
+            aligned[mask, 0], aligned[mask, 1],
+            s=80, alpha=0.95, color=peg_colors[peg], zorder=2,
+            label=f"largest disk on peg {peg}",
+        )
+    for (x, y), s in zip(aligned, states):
+        ax.text(
+            float(x), float(y), "".join(str(v + 1) for v in s),
+            fontsize=6, ha="center", va="center", zorder=3,
+            bbox={"boxstyle": "round,pad=0.12", "facecolor": "white", "alpha": 0.85, "edgecolor": "none"},
+        )
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(alpha=0.2)
+    ax.legend(loc="upper right")
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+
 def plot_labeled_sierpinski_layout(
     states: Sequence[State],
     edges: Sequence[Tuple[int, int]],
     coords: np.ndarray,
     title: str,
     out_path: Path,
+    legend_loc: str | None = None,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
 
@@ -914,9 +989,11 @@ def plot_labeled_sierpinski_layout(
             bbox={"boxstyle": "round,pad=0.12", "facecolor": "white", "alpha": 0.85, "edgecolor": "none"},
         )
 
-    ax.set_title(title)
     ax.grid(alpha=0.2)
-    ax.legend(loc="best")
+    if legend_loc == "below":
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.03), ncol=3, frameon=True)
+    elif legend_loc:
+        ax.legend(loc=legend_loc)
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
 
@@ -2084,12 +2161,21 @@ def main() -> None:
             },
         }
 
+        # Raw SEP probe: no-legend version for the SAE tile (top-left) ...
         plot_labeled_sierpinski_layout(
             states=states,
             edges=edges,
             coords=sep_coords_raw,
             title=f"Raw SEP Sierpinski - Layer {layer} - Spearman={sep_raw_rho:.3f}",
             out_path=out_dir / f"figure4_layer{layer}_raw_sep_sierpinski.png",
+        )
+        # ... and a rotated, framed, legended version (progression style) to drop in as the
+        # epoch-50 panel of the distance-matching progression figure.
+        plot_progression_style_raw_sep(
+            states=states,
+            edges=edges,
+            coords=sep_coords_raw,
+            out_path=out_dir / f"figure4b_layer{layer}_raw_sep_sierpinski_legend.png",
         )
         plot_labeled_sierpinski_layout(
             states=states,
@@ -2111,6 +2197,7 @@ def main() -> None:
             coords=move_state_coords_sae,
             title=f"SAE Move-Token Sierpinski - Layer {layer} - Spearman={move_sae_rho:.3f}",
             out_path=out_dir / f"figure7_layer{layer}_sae_move_sierpinski.png",
+            legend_loc="below",
         )
 
     feature_analysis = build_feature_analysis(z=z_best, metas=metas, vocab=vocab)

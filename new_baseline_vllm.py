@@ -32,6 +32,25 @@ VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 MODEL_NAME = "qwen3.6-27b"
 
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "12288"))
+# Optional per-disk-count output-token budget, matching the fine-tuned model's
+# eval limits. Format: "3:4096,4:4096,5:8192". Falls back to MAX_TOKENS for any
+# disk count not listed.
+MAX_TOKENS_BY_DISK: dict = {}
+_mtbd = os.environ.get("MAX_TOKENS_BY_DISK", "").strip()
+if _mtbd:
+    for _pair in _mtbd.split(","):
+        _pair = _pair.strip()
+        if not _pair:
+            continue
+        _k, _v = _pair.split(":")
+        MAX_TOKENS_BY_DISK[int(_k)] = int(_v)
+
+
+def max_tokens_for(num_disks: int) -> int:
+    """Output-token budget for a problem of the given disk count."""
+    return MAX_TOKENS_BY_DISK.get(num_disks, MAX_TOKENS)
+
+
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
 TOP_P = float(os.environ.get("TOP_P", "0.95"))
 TOP_K = int(os.environ.get("TOP_K", "20"))
@@ -71,10 +90,12 @@ def extract_think_tags(text: str) -> tuple[str, str]:
     return "", text
 
 
-def query_model(system_prompt: str, user_prompt: str) -> dict:
+def query_model(system_prompt: str, user_prompt: str, max_tokens: int = None) -> dict:
     """Query the local vLLM server."""
+    if max_tokens is None:
+        max_tokens = MAX_TOKENS
     try:
-        print(f"  Sending request to {MODEL_NAME}...", flush=True)
+        print(f"  Sending request to {MODEL_NAME} (max_tokens={max_tokens})...", flush=True)
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -83,7 +104,7 @@ def query_model(system_prompt: str, user_prompt: str) -> dict:
             ],
             temperature=TEMPERATURE,
             top_p=TOP_P,
-            max_tokens=MAX_TOKENS,
+            max_tokens=max_tokens,
             extra_body={
                 "top_k": TOP_K,
                 "min_p": MIN_P,
@@ -137,12 +158,17 @@ def main():
         raise ValueError(f"Invalid PROBLEM_MODE={problem_mode}")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    run_dir = os.path.join(OUTPUT_DIR, f"run_{TIMESTAMP}")
+    safe_alias = re.sub(r"[^A-Za-z0-9._-]+", "-", model_name).strip("-")
+    run_dir = os.path.join(OUTPUT_DIR, f"run_{TIMESTAMP}_{safe_alias}")
     os.makedirs(run_dir, exist_ok=True)
 
     print(
         f"Configuration: model={model_name}, mode={problem_mode}, "
         f"num_problems={num_problems}, disk_range={disk_range}, seed={seed}"
+    )
+    print(
+        f"Token budget: default MAX_TOKENS={MAX_TOKENS}, "
+        f"per-disk overrides={MAX_TOKENS_BY_DISK or 'none'}"
     )
     print(f"vLLM base URL: {VLLM_BASE_URL}")
 
@@ -173,7 +199,9 @@ def main():
         )
 
         start_time = time.time()
-        response = query_model(p["system_prompt"], p["user_prompt"])
+        response = query_model(
+            p["system_prompt"], p["user_prompt"], max_tokens=max_tokens_for(p["num_disks"])
+        )
         elapsed = time.time() - start_time
 
         response_text = response.get("raw_content") or response.get("answer") or ""
@@ -221,6 +249,7 @@ def main():
             "validation": validation,
             "is_optimal": bool(validation.get("is_optimal", False)),
             "elapsed_seconds": round(elapsed, 2),
+            "max_tokens": max_tokens_for(p["num_disks"]),
         }
         results.append(result)
 

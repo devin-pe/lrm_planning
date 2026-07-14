@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --partition=rome
 #SBATCH --job-name=new_baseline_copy
-#SBATCH --time=3:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=/home/dpereira/lrm_planning/work/new_baseline_copy%A.out  # Standard output (%A expands to job ID)
 
 module purge
@@ -30,13 +30,13 @@ if [ -z "$OPENROUTER_API_KEY" ]; then
 	exit 1
 fi
 
-export NUM_PROBLEMS=25
-export DISK_RANGE=3,4,5
-export PROBLEM_MODE=standard
+export NUM_PROBLEMS=66
+export DISK_RANGE=6,7
+export PROBLEM_MODE=nonstandard
 export PYTHONUNBUFFERED=1
 
 MODELS=(
-	"meta-llama/llama-4-maverick"
+	"openai/gpt-oss-120b"
 )
 
 for model in "${MODELS[@]}"; do

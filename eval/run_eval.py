@@ -68,8 +68,13 @@ def _print_summary(cfg: EvalConfig, train_cfg: Dict, summary: Dict) -> str:
     lines.append(f"  max_new_tokens:    {cfg.max_new_tokens}")
     augmented = summary.get("augmented_steer")
     if augmented:
+        layer_label = (
+            f"layers={augmented.get('probe_layers')}"
+            if augmented.get("multi_layer")
+            else f"layer={augmented.get('probe_layer')}"
+        )
         lines.append(f"  Augmented steer:   trained α = {augmented.get('trained_alpha')}  "
-                     f"layer={augmented.get('probe_layer')}  "
+                     f"{layer_label}  "
                      f"({'HOOK ON' if augmented.get('hook_active') else 'HOOK OFF (production)'})")
         if augmented.get("effective_alpha") is not None and \
                 augmented["effective_alpha"] != augmented.get("trained_alpha"):
@@ -122,6 +127,10 @@ def main() -> None:
         ckpt_type = cfg.checkpoint_type
     elif augmented_info is not None:
         ckpt_type = "augmented_steer"
+    elif train_cfg.get("regime") == "alignment_loss":
+        ckpt_type = "alignment_loss"
+    elif train_cfg.get("regime") == "base":
+        ckpt_type = "base"
     else:
         ckpt_type = "baseline"
     print(f"[run_eval] checkpoint_type = {ckpt_type}")
@@ -132,24 +141,39 @@ def main() -> None:
     # autoregressive and doesn't set sup_pos, so the hook stays a no-op there.
     if augmented_info is not None:
         from finetune.augmented_steer import (
-            install_hook as aug_install_hook, load_directions_cache,
+            install_hook as aug_install_hook,
+            install_hook_at_layer as aug_install_hook_at_layer,
+            load_directions_cache,
             set_alpha as aug_set_alpha, set_directions as aug_set_directions,
         )
         from finetune.train import _param_for_layer
         eff_alpha = (cfg.alpha_override if cfg.alpha_override is not None
                      else augmented_info["trained_alpha"])
         if cfg.hook_on:
-            directions, _gm, _raw = load_directions_cache(
-                augmented_info["steering_directions_path"]
-            )
-            aug_set_directions(directions)
             aug_set_alpha(eff_alpha)
-            target_block = _param_for_layer(model, augmented_info["probe_layer"])
-            handle = aug_install_hook(target_block)
-            augmented_info["hook_handle"] = handle
-            augmented_info["effective_alpha"] = eff_alpha
-            print(f"[run_eval] augmented_steer: --hook_on with α={eff_alpha}  "
-                  f"({len(directions)} states cached)")
+            if augmented_info.get("multi_layer"):
+                layer_ids = augmented_info["probe_layers"]
+                paths = augmented_info["steering_directions_paths"]
+                handles = []
+                for L, path in zip(layer_ids, paths):
+                    dirs, _gm, _raw = load_directions_cache(path)
+                    block = _param_for_layer(model, L)
+                    handles.append(aug_install_hook_at_layer(block, dirs))
+                augmented_info["hook_handles"] = handles
+                augmented_info["effective_alpha"] = eff_alpha
+                print(f"[run_eval] augmented_steer MULTI-LAYER: --hook_on with "
+                      f"α={eff_alpha}  layers={layer_ids}")
+            else:
+                directions, _gm, _raw = load_directions_cache(
+                    augmented_info["steering_directions_path"]
+                )
+                aug_set_directions(directions)
+                target_block = _param_for_layer(model, augmented_info["probe_layer"])
+                handle = aug_install_hook(target_block)
+                augmented_info["hook_handle"] = handle
+                augmented_info["effective_alpha"] = eff_alpha
+                print(f"[run_eval] augmented_steer: --hook_on with α={eff_alpha}  "
+                      f"({len(directions)} states cached)")
         else:
             print(f"[run_eval] augmented_steer: hook OFF (production case). "
                   f"Pass --hook_on for the diagnostic eval.")
@@ -190,14 +214,26 @@ def main() -> None:
         "eval_config": cfg.__dict__,
     }
     if augmented_info is not None:
-        summary["augmented_steer"] = {
-            "trained_alpha": augmented_info["trained_alpha"],
-            "effective_alpha": augmented_info.get("effective_alpha"),
-            "probe_layer": augmented_info["probe_layer"],
-            "baseline_checkpoint": augmented_info["baseline_checkpoint"],
-            "steering_directions_path": augmented_info["steering_directions_path"],
-            "hook_active": bool(cfg.hook_on),
-        }
+        if augmented_info.get("multi_layer"):
+            summary["augmented_steer"] = {
+                "multi_layer": True,
+                "trained_alpha": augmented_info["trained_alpha"],
+                "effective_alpha": augmented_info.get("effective_alpha"),
+                "probe_layers": augmented_info["probe_layers"],
+                "baseline_checkpoint": augmented_info["baseline_checkpoint"],
+                "steering_directions_paths": augmented_info["steering_directions_paths"],
+                "hook_active": bool(cfg.hook_on),
+            }
+        else:
+            summary["augmented_steer"] = {
+                "multi_layer": False,
+                "trained_alpha": augmented_info["trained_alpha"],
+                "effective_alpha": augmented_info.get("effective_alpha"),
+                "probe_layer": augmented_info["probe_layer"],
+                "baseline_checkpoint": augmented_info["baseline_checkpoint"],
+                "steering_directions_path": augmented_info["steering_directions_path"],
+                "hook_active": bool(cfg.hook_on),
+            }
 
     failed = False
 

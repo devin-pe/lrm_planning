@@ -1,0 +1,44 @@
+{
+  "config": {
+    "checkpoint": "toh_transformer/checkpoints/n4/best.pt",
+    "probe_checkpoint": "toh_transformer/representation_analysis.py::fit_disk_probes_and_weights (refit from SEP activations)",
+    "layers": [
+      4,
+      5,
+      6
+    ],
+    "n_donor_recipient_pairs": 5700
+  },
+  "results_by_layer": {
+    "4": {
+      "n_pairs": 5700,
+      "subspace_dim": 8,
+      "full_transfer_pct": 3.0,
+      "partial_pct": 31.42105263157895,
+      "partial_mean_k": 1.4271356783919598,
+      "unchanged_pct": 30.473684210526315,
+      "novel_correct_pct": 0.7192982456140351,
+      "disrupted_pct": 34.385964912280706
+    },
+    "5": {
+      "n_pairs": 5700,
+      "subspace_dim": 8,
+      "full_transfer_pct": 1.5614035087719298,
+      "partial_pct": 21.263157894736842,
+      "partial_mean_k": 1.3564356435643565,
+      "unchanged_pct": 40.56140350877193,
+      "novel_correct_pct": 0.8070175438596492,
+      "disrupted_pct": 35.80701754385965
+    },
+    "6": {
+      "n_pairs": 5700,
+      "subspace_dim": 8,
+      "full_transfer_pct": 0.2456140350877193,
+      "partial_pct": 9.333333333333334,
+      "partial_mean_k": 1.3026315789473684,
+      "unchanged_pct": 69.38596491228071,
+      "novel_correct_pct": 1.1929824561403508,
+      "disrupted_pct": 19.842105263157894
+    }
+  }
+}

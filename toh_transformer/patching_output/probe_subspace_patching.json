@@ -1,0 +1,42 @@
+{
+  "config": {
+    "checkpoint": "toh_transformer/checkpoints/n4/best.pt",
+    "probe_checkpoint": "toh_transformer/probe/output_0050",
+    "layers": [
+      4,
+      5,
+      6
+    ],
+    "n_donor_recipient_pairs": 5700
+  },
+  "results_by_layer": {
+    "4": {
+      "n_pairs": 5700,
+      "full_transfer_pct": 0.0,
+      "partial_pct": 0.0,
+      "partial_mean_k": 0.0,
+      "unchanged_pct": 100.0,
+      "novel_correct_pct": 0.0,
+      "disrupted_pct": 0.0
+    },
+    "5": {
+      "n_pairs": 5700,
+      "full_transfer_pct": 0.0,
+      "partial_pct": 0.0,
+      "partial_mean_k": 0.0,
+      "unchanged_pct": 100.0,
+      "novel_correct_pct": 0.0,
+      "disrupted_pct": 0.0
+    },
+    "6": {
+      "n_pairs": 5700,
+      "full_transfer_pct": 0.0,
+      "partial_pct": 0.0,
+      "partial_mean_k": 0.0,
+      "unchanged_pct": 100.0,
+      "novel_correct_pct": 0.0,
+      "disrupted_pct": 0.0
+    }
+  },
+  "probe_subspace_dim": 2
+}

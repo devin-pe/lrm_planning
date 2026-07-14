@@ -1,0 +1,155 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_h100
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=200G
+#SBATCH --job-name=qwen36_align
+#SBATCH --ntasks=1
+#SBATCH --time=12:00:00
+#SBATCH --output=/home/dpereira/lrm_planning/work/finetune_qwen36_alignment_%A.out
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load Python/3.13.1-GCCcore-14.2.0
+module load CUDA/12.8.0
+source /home/dpereira/lrm_planning/env/bin/activate
+
+REPO_ROOT=/home/dpereira/lrm_planning
+cd "$REPO_ROOT"
+
+# ── overrides ──────────────────────────────────────────────────────────────
+# Submit examples:
+#   # precompute caches + run alignment_loss only:
+#   sbatch jobs/finetune_qwen36_alignment.job
+#
+#   # baseline (LM-only LoRA on Qwen3.6) for matched comparison:
+#   sbatch --export=ALL,REGIME=baseline,OUTPUT_DIR=runs/qwen36_baseline_full \
+#          jobs/finetune_qwen36_alignment.job
+#
+#   # alignment_loss with custom α/λ:
+#   sbatch --export=ALL,ALPHA_ALIGNMENT=0.5,LAMBDA_ALIGNMENT_TARGET=0.05 \
+#          jobs/finetune_qwen36_alignment.job
+REGIME=${REGIME:-alignment_loss}                              # alignment_loss | baseline
+MODEL_ID=${MODEL_ID:-/scratch-shared/dpereira/qwen3.6-27b}
+DATA_DIR=${DATA_DIR:-hanoi_data/}
+TRAIN_FILE=${TRAIN_FILE:-train.jsonl}
+OUTPUT_DIR=${OUTPUT_DIR:-runs/qwen36_alignment_loss_L30to42}
+
+LORA_RANK=${LORA_RANK:-16}
+LORA_ALPHA=${LORA_ALPHA:-32}
+LORA_DROPOUT=${LORA_DROPOUT:-0.05}
+LR=${LR:-1e-4}
+WARMUP_STEPS=${WARMUP_STEPS:-100}
+EPOCHS=${EPOCHS:-1}
+PER_DEVICE_BS=${PER_DEVICE_BS:-2}
+GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}
+MAX_SEQ_LEN=${MAX_SEQ_LEN:-768}
+SEED=${SEED:-42}
+LOG_EVERY_STEPS=${LOG_EVERY_STEPS:-10}
+EVAL_EVERY_STEPS=${EVAL_EVERY_STEPS:-100}
+
+ALIGNMENT_BAND=${ALIGNMENT_BAND:-30,31,32,33,34,35,36,37,38,39,40,41,42}
+ALPHA_ALIGNMENT=${ALPHA_ALIGNMENT:-1.0}
+LAMBDA_ALIGNMENT_TARGET=${LAMBDA_ALIGNMENT_TARGET:-0.10}
+LAMBDA_WARMUP_FRAC=${LAMBDA_WARMUP_FRAC:-0.20}
+
+# Caches default to a subdir of $OUTPUT_DIR so each run has its own.
+CACHE_DIR=${CACHE_DIR:-$OUTPUT_DIR/precompute_cache}
+CENTROIDS_CACHE=${CENTROIDS_CACHE:-$CACHE_DIR/state_centroids.pt}
+H_BASELINE_CACHE=${H_BASELINE_CACHE:-$CACHE_DIR/h_baseline_supervised.pt}
+
+export PYTHONUNBUFFERED=1
+
+SCRATCH_DIR=${SCRATCH_DIR:-/scratch-shared/dpereira}
+mkdir -p "$SCRATCH_DIR"
+export HF_HOME=${HF_HOME:-$SCRATCH_DIR/hf_cache}
+export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$SCRATCH_DIR/transformers}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$SCRATCH_DIR/datasets}
+export TORCH_HOME=${TORCH_HOME:-$SCRATCH_DIR/torch_cache}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$SCRATCH_DIR/triton_cache}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$SCRATCH_DIR/cache}
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" \
+         "$TORCH_HOME" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME"
+
+echo "================= Qwen3.6 alignment-loss fine-tune ================="
+echo "REGIME:                  $REGIME"
+echo "MODEL_ID:                $MODEL_ID"
+echo "DATA_DIR:                $DATA_DIR  (train_file=$TRAIN_FILE)"
+echo "OUTPUT_DIR:              $OUTPUT_DIR"
+echo "LORA r/alpha:            $LORA_RANK / $LORA_ALPHA  (dropout $LORA_DROPOUT)"
+echo "LR:                      $LR  (warmup_steps=$WARMUP_STEPS)"
+echo "EPOCHS:                  $EPOCHS"
+echo "PER_DEVICE_BS:           $PER_DEVICE_BS  (grad_accum=$GRAD_ACCUM_STEPS)"
+echo "MAX_SEQ_LEN:             $MAX_SEQ_LEN"
+echo "SEED:                    $SEED"
+if [[ "$REGIME" == "alignment_loss" ]]; then
+  echo "ALIGNMENT_BAND:          $ALIGNMENT_BAND"
+  echo "ALPHA_ALIGNMENT:         $ALPHA_ALIGNMENT"
+  echo "LAMBDA_ALIGNMENT_TARGET: $LAMBDA_ALIGNMENT_TARGET"
+  echo "LAMBDA_WARMUP_FRAC:      $LAMBDA_WARMUP_FRAC"
+  echo "CACHE_DIR:               $CACHE_DIR"
+fi
+echo "Python:                  $(which python)"
+python --version
+echo "CUDA_VISIBLE_DEVICES:    ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "===================================================================="
+
+mkdir -p "$OUTPUT_DIR" work
+
+# ── Precompute caches (alignment_loss only) ────────────────────────────────
+if [[ "$REGIME" == "alignment_loss" ]]; then
+  mkdir -p "$CACHE_DIR"
+  if [[ ! -f "$CENTROIDS_CACHE" || ! -f "$H_BASELINE_CACHE" ]]; then
+    echo "[precompute] one or both caches missing — running precompute_alignment …"
+    python -m finetune.precompute_alignment \
+      --model_id "$MODEL_ID" \
+      --data_dir "$DATA_DIR" \
+      --train_file "$TRAIN_FILE" \
+      --output_dir "$CACHE_DIR" \
+      --alignment_band "$ALIGNMENT_BAND" \
+      --max_seq_len "$MAX_SEQ_LEN" \
+      --batch_size 2
+  else
+    echo "[precompute] reusing $CENTROIDS_CACHE"
+    echo "[precompute] reusing $H_BASELINE_CACHE"
+  fi
+fi
+
+# ── Build the train command ────────────────────────────────────────────────
+CMD=(accelerate launch
+  --num_processes 1
+  --mixed_precision bf16
+  finetune/train.py
+    --regime "$REGIME"
+    --model_id "$MODEL_ID"
+    --lora_rank "$LORA_RANK"
+    --lora_alpha "$LORA_ALPHA"
+    --lora_dropout "$LORA_DROPOUT"
+    --lr "$LR"
+    --warmup_steps "$WARMUP_STEPS"
+    --epochs "$EPOCHS"
+    --per_device_batch_size "$PER_DEVICE_BS"
+    --grad_accum_steps "$GRAD_ACCUM_STEPS"
+    --max_seq_len "$MAX_SEQ_LEN"
+    --seed "$SEED"
+    --data_dir "$DATA_DIR"
+    --train_file "$TRAIN_FILE"
+    --output_dir "$OUTPUT_DIR"
+    --log_every_steps "$LOG_EVERY_STEPS"
+    --eval_every_steps "$EVAL_EVERY_STEPS"
+)
+if [[ "$REGIME" == "alignment_loss" ]]; then
+  CMD+=(--alignment_band         "$ALIGNMENT_BAND")
+  CMD+=(--alpha_alignment        "$ALPHA_ALIGNMENT")
+  CMD+=(--lambda_alignment_target "$LAMBDA_ALIGNMENT_TARGET")
+  CMD+=(--lambda_warmup_frac     "$LAMBDA_WARMUP_FRAC")
+  CMD+=(--centroids_cache        "$CENTROIDS_CACHE")
+  CMD+=(--h_baseline_cache       "$H_BASELINE_CACHE")
+fi
+
+"${CMD[@]}"
+
+echo "Qwen3.6 fine-tune ($REGIME) completed → $OUTPUT_DIR"

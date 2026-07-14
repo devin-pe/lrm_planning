@@ -58,7 +58,7 @@ def parse_args(argv: Optional[List[str]] = None) -> EvalConfig:
                         "Useful for ablations (α=0 = no steering, α=10 = "
                         "magnified).")
     p.add_argument("--checkpoint_type",
-                   choices=["auto", "baseline", "augmented_steer"],
+                   choices=["auto", "baseline", "augmented_steer", "alignment_loss"],
                    default="auto",
                    help="Override the checkpoint label in the output table. "
                         "Auto-detect: regime field in config.json.")

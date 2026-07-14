@@ -22,17 +22,21 @@ cd "$REPO_ROOT"
 
 MODEL_PATH=${MODEL_PATH:-/scratch-shared/dpereira/qwen3.6-27b}
 MODEL_ALIAS=${MODEL_ALIAS:-qwen3.6-27b}
-NUM_PROBLEMS=${NUM_PROBLEMS:-100}
-DISK_RANGE=${DISK_RANGE:-3,4,5}
+NUM_PROBLEMS=${NUM_PROBLEMS:-66}
+DISK_RANGE=${DISK_RANGE:-6,7}
 PROBLEM_MODE=${PROBLEM_MODE:-nonstandard}
 SEED=${SEED:-42}
-MAX_TOKENS=${MAX_TOKENS:-12288}
+# Flat output-token budget, matched to the OpenRouter baseline job
+# (new_baseline.py uses max_completion_tokens=32000 for all problems).
+MAX_TOKENS=${MAX_TOKENS:-32000}
+# Empty => use flat MAX_TOKENS for every disk count (matches OpenRouter job).
+MAX_TOKENS_BY_DISK=${MAX_TOKENS_BY_DISK:-}
 TEMPERATURE=${TEMPERATURE:-1.0}
 TOP_P=${TOP_P:-0.95}
 TOP_K=${TOP_K:-20}
 MIN_P=${MIN_P:-0.0}
 VLLM_PORT=${VLLM_PORT:-8000}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-40960}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.90}
 
 export PYTHONUNBUFFERED=1
@@ -64,6 +68,7 @@ echo "DISK_RANGE:    $DISK_RANGE"
 echo "PROBLEM_MODE:  $PROBLEM_MODE"
 echo "SEED:          $SEED"
 echo "MAX_TOKENS:    $MAX_TOKENS"
+echo "MAX_TOKENS_BY_DISK: $MAX_TOKENS_BY_DISK"
 echo "MAX_MODEL_LEN: $MAX_MODEL_LEN"
 echo "Python:        $(which python)"
 python --version
@@ -112,6 +117,7 @@ DISK_RANGE="$DISK_RANGE" \
 PROBLEM_MODE="$PROBLEM_MODE" \
 SEED="$SEED" \
 MAX_TOKENS="$MAX_TOKENS" \
+MAX_TOKENS_BY_DISK="$MAX_TOKENS_BY_DISK" \
 TEMPERATURE="$TEMPERATURE" \
 TOP_P="$TOP_P" \
 TOP_K="$TOP_K" \

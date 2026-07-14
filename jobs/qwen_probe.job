@@ -31,6 +31,16 @@ EPOCHS=${EPOCHS:-2000}
 LR=${LR:-1e-3}
 SEED=${SEED:-42}
 BATCH_SIZE=${BATCH_SIZE:-4}
+# Generation settings (Step 1). max_tokens matches the OpenRouter baseline; the
+# model supports 262144 ctx but we override to a right-sized window since prompts
+# are small and max_tokens caps output at 32000.
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-65536}
+MAX_TOKENS=${MAX_TOKENS:-32000}
+TEMPERATURE=${TEMPERATURE:-1.0}
+TOP_P=${TOP_P:-0.95}
+TOP_K=${TOP_K:-20}
+MIN_P=${MIN_P:-0.0}
+PRESENCE_PENALTY=${PRESENCE_PENALTY:-1.5}
 
 export PYTHONUNBUFFERED=1
 
@@ -55,6 +65,9 @@ echo "EPOCHS:      $EPOCHS"
 echo "LR:          $LR"
 echo "SEED:        $SEED"
 echo "BATCH_SIZE:  $BATCH_SIZE"
+echo "MAX_MODEL_LEN: $MAX_MODEL_LEN"
+echo "MAX_TOKENS:    $MAX_TOKENS"
+echo "PRESENCE_PENALTY: $PRESENCE_PENALTY"
 echo "Python:      $(which python)"
 python --version
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
@@ -62,6 +75,25 @@ echo "===================================="
 
 mkdir -p "$OUTPUT_DIR"
 
+# ── Step 1: Generate responses for all states (vLLM) ─────────────────────────
+echo "[Step 1] Generating responses with vLLM..."
+python -u generate.py \
+  --model              "$MODEL_NAME"       \
+  --tokenizer          "$MODEL_NAME"       \
+  --n_disks            "$N_DISKS"          \
+  --output_dir         "$OUTPUT_DIR"       \
+  --dtype              "$DTYPE"            \
+  --max_model_len      "$MAX_MODEL_LEN"    \
+  --max_tokens         "$MAX_TOKENS"       \
+  --temperature        "$TEMPERATURE"      \
+  --top_p              "$TOP_P"            \
+  --top_k              "$TOP_K"            \
+  --min_p              "$MIN_P"            \
+  --presence_penalty   "$PRESENCE_PENALTY" \
+  --seed               "$SEED"
+
+# ── Step 2: Probe hidden states (HF transformers) ────────────────────────────
+echo "[Step 2] Probing hidden states..."
 python -u probe.py \
   --model_name  "$MODEL_NAME"  \
   --n_disks     "$N_DISKS"     \

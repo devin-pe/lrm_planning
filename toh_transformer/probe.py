@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from collections import deque
 from pathlib import Path
@@ -365,6 +366,41 @@ def rotate_positions(positions: np.ndarray, degrees_clockwise: float) -> np.ndar
     return rotated.astype(np.float32)
 
 
+# Canonical upright Sierpinski corners: largest disk on peg 1 -> apex (blue on top),
+# matching the colour layout of figure5_*_sae_sep_sierpinski.png.
+_SIERPINSKI_CORNERS = {1: (0.0, 1.0), 0: (0.8660254, -0.5), 2: (-0.8660254, -0.5)}
+
+
+def canonical_sierpinski_layout(states: Sequence[State]) -> np.ndarray:
+    """Reference Tower-of-Hanoi Sierpinski coordinates (largest disk = last index)."""
+    pts = []
+    for s in states:
+        n = len(s)
+        x = y = 0.0
+        for i, peg in enumerate(s):
+            w = 0.5 ** (n - 1 - i)  # largest disk (last index) dominates the layout
+            cx, cy = _SIERPINSKI_CORNERS[peg]
+            x += w * cx
+            y += w * cy
+        pts.append((x, y))
+    return np.asarray(pts, dtype=np.float64)
+
+
+def align_to_canonical(positions: np.ndarray, states: Sequence[State]) -> np.ndarray:
+    """Rotate/reflect the probe layout onto the canonical upright Sierpinski.
+
+    The distance-matching probe is invariant to rotation/reflection, so a fixed rotation
+    does not orient it reliably across runs. Orthogonal Procrustes alignment to the
+    canonical layout gives a consistent upright orientation regardless of the run's RNG.
+    """
+    P = positions.astype(np.float64)
+    Q = canonical_sierpinski_layout(states)
+    Pc = P - P.mean(axis=0, keepdims=True)
+    Qc = Q - Q.mean(axis=0, keepdims=True)
+    U, _, Vt = np.linalg.svd(Pc.T @ Qc)
+    return (Pc @ (U @ Vt)).astype(np.float32)
+
+
 def plot_labeled_state_map(
     positions: np.ndarray,
     states: Sequence[State],
@@ -373,24 +409,43 @@ def plot_labeled_state_map(
     out_path: Path,
     rotation_deg_clockwise: float = 0.0,
     text_rotation_deg_clockwise: float = 0.0,
+    show_legend: bool = False,
 ) -> None:
-    """Plot a large, fully labeled graph so every point can be matched to a state id."""
-    if rotation_deg_clockwise != 0.0:
-        positions = rotate_positions(positions, degrees_clockwise=rotation_deg_clockwise)
+    """Plot the labeled state map in the SAE-figure style: nodes coloured by the peg that
+    holds the largest disk, grey graph edges, white-boxed state labels. The SAE legend is
+    drawn only when ``show_legend`` is True. No title. Orientation is fixed by Procrustes
+    alignment to the canonical upright Sierpinski (a fixed rotation does not orient the
+    probe reliably across runs). The ``rotation_deg_clockwise`` / ``title`` arguments are
+    kept for caller compatibility but unused."""
+    positions = align_to_canonical(positions, states)
 
-    fig, ax = plt.subplots(figsize=(14, 12))
+    fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
 
     for i, j in edges:
         ax.plot(
             [positions[i, 0], positions[j, 0]],
             [positions[i, 1], positions[j, 1]],
-            color="lightgray",
-            linewidth=0.5,
+            color="gray",
+            linewidth=0.8,
             alpha=0.5,
             zorder=1,
         )
 
-    ax.scatter(positions[:, 0], positions[:, 1], c="#1f77b4", s=18, alpha=0.9, zorder=2)
+    # Colour each configuration by the peg holding the largest disk (last state index),
+    # matching figure5_*_sae_sep_sierpinski.png.
+    peg_colors = {0: "red", 1: "blue", 2: "green"}
+    largest_disk_peg = np.array([s[-1] for s in states], dtype=np.int64)
+    for peg in (0, 1, 2):
+        mask = largest_disk_peg == peg
+        ax.scatter(
+            positions[mask, 0],
+            positions[mask, 1],
+            s=80,
+            alpha=0.95,
+            color=peg_colors[peg],
+            zorder=2,
+            label=f"largest disk on peg {peg}",
+        )
 
     labels = [state_to_label(state) for state in states]
     for (x, y), label in zip(positions, labels):
@@ -398,23 +453,20 @@ def plot_labeled_state_map(
             float(x),
             float(y),
             label,
-            fontsize=7,
+            fontsize=6,
             ha="center",
             va="center",
             rotation=-text_rotation_deg_clockwise,
             color="black",
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.55, "pad": 0.25},
+            bbox={"boxstyle": "round,pad=0.12", "facecolor": "white", "edgecolor": "none", "alpha": 0.85},
             zorder=3,
         )
 
-    ax.set_title(title)
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
     ax.set_aspect("equal", adjustable="box")
     ax.grid(alpha=0.2)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=340)
+    if show_legend:
+        ax.legend(loc="best")
+    fig.savefig(out_path, dpi=300)
     plt.close(fig)
 
 
@@ -426,8 +478,8 @@ load_model = utils.load_model
 def main() -> None:
     args = parse_args()
 
-    torch.manual_seed(0)
-    np.random.seed(0)
+    torch.manual_seed(42)  # same seed as sae_analysis.py, which produced clean layouts
+    np.random.seed(42)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -448,6 +500,10 @@ def main() -> None:
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    # Only the final-epoch (epoch 50) figures carry the legend; earlier epochs omit it.
+    epoch_match = re.search(r"epoch_(\d+)", checkpoint_path.stem)
+    show_legend = epoch_match is not None and int(epoch_match.group(1)) == 50
 
     model = load_model(checkpoint_path=checkpoint_path, n_disks=args.n_disks, device=device)
 
@@ -529,6 +585,7 @@ def main() -> None:
             out_path=output_dir / f"layer_{layer:02d}_probe_space_labeled.png",
             rotation_deg_clockwise=60.0,
             text_rotation_deg_clockwise=0.0,
+            show_legend=show_legend,
         )
 
     plot_spearman_bar(
@@ -548,6 +605,7 @@ def main() -> None:
         out_path=output_dir / f"best_layer_{best_layer:02d}_probe_space_labeled.png",
         rotation_deg_clockwise=60.0,
         text_rotation_deg_clockwise=0.0,
+        show_legend=show_legend,
     )
 
     (output_dir / "summary_sorted_by_spearman.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
